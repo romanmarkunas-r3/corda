@@ -110,8 +110,12 @@ data class CmdLineOptions(val baseDirectory: Path,
                 mapOf("noLocalShell" to this.noLocalShell)
         )).parseAsNodeConfiguration()
 
-        if (nodeRegistrationConfig != null) {
-            requireNotNull(config.compatibilityZoneURL) { "Compatibility Zone Url must be provided in registration mode." }
+            if (nodeRegistrationConfig != null) {
+                require(!config.devMode) { "registration cannot occur in devMode" }
+                require(config.compatibilityZoneURL != null || config.networkServices != null) {
+                    "compatibilityZoneURL or networkServices must be present in the node configuration file in registration mode."
+                }
+            }
         }
 
         return config
