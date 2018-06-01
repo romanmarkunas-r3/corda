@@ -8,6 +8,7 @@ import net.corda.sandbox.rewiring.SandboxClassLoadingException
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatExceptionOfType
 import org.junit.Test
+import java.nio.file.Files
 import java.util.*
 
 class SandboxExecutorTest : TestBase() {
@@ -43,6 +44,8 @@ class SandboxExecutorTest : TestBase() {
             throw IllegalArgumentException("Contract constraint violated")
         }
     }
+
+    data class Transaction(val id: Int)
 
     @Test
     fun `can load and execute code that overrides object hash code`() = sandbox(DEFAULT) {
@@ -195,6 +198,44 @@ class SandboxExecutorTest : TestBase() {
         var value = 0
     }
 
-    data class Transaction(val id: Int)
+    @Test
+    fun `can load and execute code that uses IO`() = sandbox(DEFAULT) {
+        val contractExecutor = DeterministicSandboxExecutor<Int, Int>(configuration)
+        assertThatExceptionOfType(SandboxException::class.java)
+                .isThrownBy { contractExecutor.run<TestIO>(0) }
+                .withCauseInstanceOf(SandboxClassLoadingException::class.java)
+                .withMessageContaining("Invalid reference")
+                .withMessageContaining("Files.createTempFile")
+                .withMessageContaining("Files.newBufferedWriter")
+                .withMessageContaining("entity is not whitelisted")
+    }
+
+    class TestIO : SandboxedRunnable<Int, Int> {
+        override fun run(input: Int): Int? {
+            val file = Files.createTempFile("test", ".dat")
+            Files.newBufferedWriter(file).use {
+                it.write("Hello world!")
+            }
+            return 0
+        }
+    }
+
+    @Test
+    fun `can load and execute code that uses reflection`() = sandbox(DEFAULT) {
+        val contractExecutor = DeterministicSandboxExecutor<Int, Int>(configuration)
+        assertThatExceptionOfType(SandboxException::class.java)
+                .isThrownBy { contractExecutor.run<TestReflection>(0) }
+                .withCauseInstanceOf(SandboxClassLoadingException::class.java)
+                .withMessageContaining("Disallowed reference to Class.newInstance()")
+    }
+
+    class TestReflection : SandboxedRunnable<Int, Int> {
+        override fun run(input: Int): Int? {
+            val clazz = Object::class.java
+            val obj = clazz.newInstance()
+            val result = clazz.methods.first().invoke(obj)
+            return obj.hashCode() + result.hashCode()
+        }
+    }
 
 }
