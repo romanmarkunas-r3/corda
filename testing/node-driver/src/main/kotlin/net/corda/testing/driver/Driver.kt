@@ -281,11 +281,11 @@ data class DriverParameters(
         val waitForAllNodesToFinish: Boolean = false,
         val notarySpecs: List<NotarySpec> = listOf(NotarySpec(DUMMY_NOTARY_NAME)),
         val extraCordappPackagesToScan: List<String> = emptyList(),
-        val inMemoryDB: Boolean = true,
         val jmxPolicy: JmxPolicy = JmxPolicy(),
         val networkParameters: NetworkParameters = testNetworkParameters(notaries = emptyList()),
         val notaryCustomOverrides: Map<String, Any?> = emptyMap(),
-        val initialiseSerialization: Boolean = true
+        val initialiseSerialization: Boolean = true,
+        val inMemoryDB: Boolean = true
     ) {
     constructor(
             isDebug: Boolean,
@@ -311,10 +311,10 @@ data class DriverParameters(
             waitForAllNodesToFinish,
             notarySpecs,
             extraCordappPackagesToScan,
-            true,
             jmxPolicy,
             networkParameters,
             emptyMap(),
+            true,
             true
     )
 
@@ -343,11 +343,11 @@ data class DriverParameters(
             waitForAllNodesToFinish,
             notarySpecs,
             extraCordappPackagesToScan,
-            true,
             jmxPolicy,
             networkParameters,
             emptyMap(),
-            initialiseSerialization
+            initialiseSerialization,
+            true
     )
 
     fun withIsDebug(isDebug: Boolean): DriverParameters = copy(isDebug = isDebug)
