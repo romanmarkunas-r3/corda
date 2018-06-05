@@ -381,8 +381,8 @@ class DriverDSLImpl(
                 baseDirectory = baseDirectory(name),
                 allowMissingConfig = true,
                 configOverrides = rawConfig.toNodeOnly()
-        )
-        val cordaConfig = typesafe.parseAsNodeConfiguration() + getDatabaseConfig()
+        ) + getDatabaseConfig()
+        val cordaConfig = typesafe.parseAsNodeConfiguration()
         val config = NodeConfig(rawConfig, cordaConfig)
         return startNodeInternal(config, webAddress, null, "512m", localNetworkMap)
     }
