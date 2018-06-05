@@ -234,7 +234,7 @@ fun <A> driver(defaultParameters: DriverParameters = DriverParameters(), dsl: Dr
                     jmxPolicy = defaultParameters.jmxPolicy,
                     compatibilityZone = null,
                     networkParameters = defaultParameters.networkParameters,
-                    notaryCustomOverrides = defaultParameters.notaryCustomOverrides
+                    notaryCustomOverrides = defaultParameters.notaryCustomOverrides,
                     inMemoryDB = defaultParameters.inMemoryDB
             ),
             coerce = { it },
@@ -311,6 +311,7 @@ data class DriverParameters(
             waitForAllNodesToFinish,
             notarySpecs,
             extraCordappPackagesToScan,
+            true,
             jmxPolicy,
             networkParameters,
             emptyMap(),
@@ -342,6 +343,7 @@ data class DriverParameters(
             waitForAllNodesToFinish,
             notarySpecs,
             extraCordappPackagesToScan,
+            true,
             jmxPolicy,
             networkParameters,
             emptyMap(),
