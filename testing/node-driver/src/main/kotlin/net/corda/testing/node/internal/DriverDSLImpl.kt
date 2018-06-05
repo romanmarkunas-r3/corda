@@ -513,7 +513,7 @@ class DriverDSLImpl(
     private fun startNotaries(localNetworkMap: LocalNetworkMap?): List<CordaFuture<List<NodeHandle>>> {
         return notarySpecs.map {
             when (it.cluster) {
-                null -> startSingleNotary(it, localNetworkMap, customOverrides)
+                null -> startSingleNotary(it, localNetworkMap)
                 is ClusterSpec.Raft,
                     // DummyCluster is used for testing the notary communication path, and it does not matter
                     // which underlying consensus algorithm is used, so we just stick to Raft

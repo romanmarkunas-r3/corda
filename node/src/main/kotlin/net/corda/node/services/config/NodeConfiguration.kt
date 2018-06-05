@@ -127,17 +127,6 @@ data class NetworkServicesConfig(
         val inferred : Boolean = false
 )
 
-/**
- * Currently only used for notarisation requests.
- *
- * When the response doesn't arrive in time, the message is resent to a different notary-replica round-robin
- * in case of clustered notaries.
- */
-data class P2PMessagingRetryConfiguration(
-        val messageRedeliveryDelay: Duration,
-        val maxRetryCount: Int,
-        val backoffBase: Double
-)
 
 fun Config.parseAsNodeConfiguration(): NodeConfiguration = parseAs<NodeConfigurationImpl>()
 
@@ -189,7 +178,6 @@ data class NodeConfigurationImpl(
             explicitAddress != null -> {
                 require(settings.address == null) { "Can't provide top-level rpcAddress and rpcSettings.address (they control the same property)." }
                 logger.warn("Top-level declaration of property 'rpcAddress' is deprecated. Please use 'rpcSettings.address' instead.")
-
                 settings.copy(address = explicitAddress)
             }
             else -> settings
@@ -199,6 +187,7 @@ data class NodeConfigurationImpl(
     override fun validate(): List<String> {
         val errors = mutableListOf<String>()
         errors += validateRpcOptions(rpcOptions)
+        errors += validateDevModeOptions()
         errors += validateNetworkServices()
         return errors
     }
@@ -212,6 +201,8 @@ data class NodeConfigurationImpl(
         }
         return errors
     }
+
+    override val exportJMXto: String get() = "http"
 
     private fun validateDevModeOptions(): List<String> {
         if (devMode) {
