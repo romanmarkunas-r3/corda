@@ -21,10 +21,10 @@ import net.corda.finance.flows.TwoPartyDealFlow.Instigator
 import net.corda.finance.plugin.registerFinanceJSONMappers
 import net.corda.irs.contract.InterestRateSwap
 import net.corda.irs.flows.FixingFlow
-import net.corda.testing.core.chooseIdentity
+import net.corda.testing.core.singleIdentity
 import net.corda.testing.node.InMemoryMessagingNetwork
+import net.corda.testing.node.internal.startFlow
 import net.corda.testing.node.makeTestIdentityService
-import net.corda.testing.node.startFlow
 import rx.Observable
 import java.time.LocalDate
 import java.util.*
@@ -94,10 +94,7 @@ class IRSSimulation(networkSendManuallyPumped: Boolean, runAsync: Boolean, laten
         val node1 = banks[i].started!!
         val node2 = banks[j].started!!
 
-        val swaps =
-                node1.database.transaction {
-                    node1.services.vaultService.queryBy<InterestRateSwap.State>().states
-                }
+        val swaps = node1.services.vaultService.queryBy<InterestRateSwap.State>().states
         val theDealRef: StateAndRef<InterestRateSwap.State> = swaps.single()
 
         // Do we have any more days left in this deal's lifetime? If not, return.
@@ -129,12 +126,14 @@ class IRSSimulation(networkSendManuallyPumped: Boolean, runAsync: Boolean, laten
         // have the convenient copy() method that'd let us make small adjustments. Instead they're partly mutable.
         // TODO: We should revisit this in post-Excalibur cleanup and fix, e.g. by introducing an interface.
 
-        val irs = om.readValue<InterestRateSwap.State>(javaClass.classLoader.getResourceAsStream("net/corda/irs/web/simulation/trade.json")
+        val resourceAsStream = javaClass.classLoader.getResourceAsStream("net/corda/irs/web/simulation/trade.json")
+                ?: error("Trade representation cannot be loaded.")
+        val irs = om.readValue<InterestRateSwap.State>(resourceAsStream
                 .reader()
                 .readText()
                 .replace("oracleXXX", RatesOracleNode.RATES_SERVICE_NAME.toString()))
-        irs.fixedLeg.fixedRatePayer = node1.info.chooseIdentity()
-        irs.floatingLeg.floatingRatePayer = node2.info.chooseIdentity()
+        irs.fixedLeg.fixedRatePayer = node1.info.singleIdentity()
+        irs.floatingLeg.floatingRatePayer = node2.info.singleIdentity()
         node1.registerInitiatedFlow(FixingFlow.Fixer::class.java)
         node2.registerInitiatedFlow(FixingFlow.Fixer::class.java)
         @InitiatingFlow
@@ -158,9 +157,9 @@ class IRSSimulation(networkSendManuallyPumped: Boolean, runAsync: Boolean, laten
         showConsensusFor(listOf(node1.internals, node2.internals, regulators[0]))
 
         val instigator = StartDealFlow(
-                node2.info.chooseIdentity(),
+                node2.info.singleIdentity(),
                 AutoOffer(mockNet.defaultNotaryIdentity, irs)) // TODO Pass notary as parameter to Simulation.
-        val instigatorTxFuture = node1.services.startFlow(instigator)
+        val instigatorTxFuture = node1.services.startFlow(instigator).resultFuture
 
         return allOf(instigatorTxFuture.toCompletableFuture(), acceptorTxFuture).thenCompose { instigatorTxFuture.toCompletableFuture() }
     }

@@ -12,14 +12,15 @@ import net.corda.node.services.api.ServiceHubInternal
 import net.corda.node.services.schema.NodeSchemaService.NodeCoreV1
 import net.corda.node.services.schema.NodeSchemaService.NodeNotaryV1
 import net.corda.testing.driver.DriverParameters
-import net.corda.testing.driver.InProcess
 import net.corda.testing.driver.driver
+import net.corda.testing.driver.internal.InProcessImpl
 import net.corda.testing.internal.vault.DummyLinearStateSchemaV1
-import net.corda.testing.node.MockNetwork
+import net.corda.testing.node.internal.InternalMockNetwork
 import org.hibernate.annotations.Cascade
 import org.hibernate.annotations.CascadeType
 import org.junit.Ignore
 import org.junit.Test
+import java.io.Serializable
 import javax.persistence.*
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -31,7 +32,7 @@ class NodeSchemaServiceTest {
      */
     @Test
     fun `registering custom schemas for testing with MockNode`() {
-        val mockNet = MockNetwork(cordappPackages = listOf(DummyLinearStateSchemaV1::class.packageName))
+        val mockNet = InternalMockNetwork(cordappPackages = listOf(DummyLinearStateSchemaV1::class.packageName))
         val mockNode = mockNet.createNode()
         val schemaService = mockNode.services.schemaService
         assertTrue(schemaService.schemaOptions.containsKey(DummyLinearStateSchemaV1))
@@ -40,7 +41,7 @@ class NodeSchemaServiceTest {
 
     @Test
     fun `check node runs with minimal core schema set`() {
-        val mockNet = MockNetwork(cordappPackages = emptyList())
+        val mockNet = InternalMockNetwork(cordappPackages = emptyList())
         val mockNode = mockNet.createNode()
         val schemaService = mockNode.services.schemaService
 
@@ -52,7 +53,7 @@ class NodeSchemaServiceTest {
 
     @Test
     fun `check node runs inclusive of notary node schema set`() {
-        val mockNet = MockNetwork(cordappPackages = emptyList())
+        val mockNet = InternalMockNetwork(cordappPackages = emptyList())
         val mockNotaryNode = mockNet.notaryNodes.first()
         val schemaService = mockNotaryNode.services.schemaService
 
@@ -80,7 +81,7 @@ class NodeSchemaServiceTest {
     fun `custom schemas are loaded eagerly`() {
         val expected = setOf("PARENTS", "CHILDREN")
         val tables = driver(DriverParameters(startNodesInProcess = true)) {
-            (defaultNotaryNode.getOrThrow() as InProcess).database.transaction {
+            (defaultNotaryNode.getOrThrow() as InProcessImpl).database.transaction {
                 session.createNativeQuery("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES").list()
             }
         }
@@ -106,8 +107,8 @@ class NodeSchemaServiceTest {
     @Test
     fun `check node runs inclusive of notary node schema set using driverDSL`() {
         driver(DriverParameters(startNodesInProcess = true)) {
-            val notaryNode = defaultNotaryNode.getOrThrow().rpc.startFlow(::MappedSchemasFlow)
-            val mappedSchemas = notaryNode.returnValue.getOrThrow()
+            val notary = defaultNotaryNode.getOrThrow()
+            val mappedSchemas = notary.rpc.startFlow(::MappedSchemasFlow).returnValue.getOrThrow()
             // check against NodeCore + NodeNotary Schemas
             assertTrue(mappedSchemas.contains(NodeCoreV1.name))
             assertTrue(mappedSchemas.contains(NodeNotaryV1.name))
@@ -141,7 +142,7 @@ object TestSchema : MappedSchema(SchemaFamily::class.java, 1, setOf(Parent::clas
     @Suppress("unused")
     @Entity
     @Table(name = "Children")
-    class Child {
+    class Child : Serializable {
         @Id
         @GeneratedValue
         @Column(name = "child_id", unique = true, nullable = false)

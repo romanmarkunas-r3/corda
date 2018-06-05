@@ -1,9 +1,9 @@
 package net.corda.testing.node.internal
 
 import net.corda.client.mock.Generator
-import net.corda.client.rpc.internal.KryoClientSerializationScheme
+import net.corda.client.rpc.internal.CordaRPCClientConfigurationImpl
 import net.corda.client.rpc.internal.RPCClient
-import net.corda.client.rpc.internal.RPCClientConfiguration
+import net.corda.client.rpc.internal.serialization.amqp.AMQPClientSerializationScheme
 import net.corda.core.concurrent.CordaFuture
 import net.corda.core.context.AuthServiceId
 import net.corda.core.context.Trace
@@ -15,14 +15,15 @@ import net.corda.core.internal.concurrent.map
 import net.corda.core.internal.div
 import net.corda.core.internal.uncheckedCast
 import net.corda.core.messaging.RPCOps
+import net.corda.core.node.NetworkParameters
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.node.internal.security.RPCSecurityManagerImpl
 import net.corda.node.services.messaging.RPCServer
 import net.corda.node.services.messaging.RPCServerConfiguration
 import net.corda.nodeapi.ArtemisTcpTransport
-import net.corda.nodeapi.ConnectionDirection
 import net.corda.nodeapi.RPCApi
-import net.corda.nodeapi.internal.serialization.KRYO_RPC_CLIENT_CONTEXT
+import net.corda.serialization.internal.AMQP_RPC_CLIENT_CONTEXT
+import net.corda.testing.common.internal.testNetworkParameters
 import net.corda.testing.core.MAX_MESSAGE_SIZE
 import net.corda.testing.driver.JmxPolicy
 import net.corda.testing.driver.PortAllocation
@@ -39,14 +40,13 @@ import org.apache.activemq.artemis.core.config.CoreQueueConfiguration
 import org.apache.activemq.artemis.core.config.impl.ConfigurationImpl
 import org.apache.activemq.artemis.core.remoting.impl.invm.InVMAcceptorFactory
 import org.apache.activemq.artemis.core.remoting.impl.invm.InVMConnectorFactory
-import org.apache.activemq.artemis.core.remoting.impl.netty.NettyAcceptorFactory
 import org.apache.activemq.artemis.core.security.CheckType
 import org.apache.activemq.artemis.core.security.Role
 import org.apache.activemq.artemis.core.server.embedded.EmbeddedActiveMQ
 import org.apache.activemq.artemis.core.server.impl.ActiveMQServerImpl
 import org.apache.activemq.artemis.core.settings.impl.AddressFullMessagePolicy
 import org.apache.activemq.artemis.core.settings.impl.AddressSettings
-import org.apache.activemq.artemis.spi.core.remoting.Connection
+import org.apache.activemq.artemis.spi.core.protocol.RemotingConnection
 import org.apache.activemq.artemis.spi.core.security.ActiveMQSecurityManager3
 import java.lang.reflect.Method
 import java.nio.file.Path
@@ -57,7 +57,7 @@ import net.corda.nodeapi.internal.config.User as InternalUser
 inline fun <reified I : RPCOps> RPCDriverDSL.startInVmRpcClient(
         username: String = rpcTestUser.username,
         password: String = rpcTestUser.password,
-        configuration: RPCClientConfiguration = RPCClientConfiguration.default
+        configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
 ) = startInVmRpcClient(I::class.java, username, password, configuration)
 
 inline fun <reified I : RPCOps> RPCDriverDSL.startRandomRpcClient(
@@ -70,8 +70,15 @@ inline fun <reified I : RPCOps> RPCDriverDSL.startRpcClient(
         rpcAddress: NetworkHostAndPort,
         username: String = rpcTestUser.username,
         password: String = rpcTestUser.password,
-        configuration: RPCClientConfiguration = RPCClientConfiguration.default
+        configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
 ) = startRpcClient(I::class.java, rpcAddress, username, password, configuration)
+
+inline fun <reified I : RPCOps> RPCDriverDSL.startRpcClient(
+        haAddressPool: List<NetworkHostAndPort>,
+        username: String = rpcTestUser.username,
+        password: String = rpcTestUser.password,
+        configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
+) = startRpcClient(I::class.java, haAddressPool, username, password, configuration)
 
 data class RpcBrokerHandle(
         val hostAndPort: NetworkHostAndPort?,
@@ -106,7 +113,8 @@ fun <A> rpcDriver(
         notarySpecs: List<NotarySpec> = emptyList(),
         externalTrace: Trace? = null,
         jmxPolicy: JmxPolicy = JmxPolicy(),
-        maxTransactionSize: Int = Int.MAX_VALUE,
+        networkParameters: NetworkParameters = testNetworkParameters(),
+        notaryCustomOverrides: Map<String, Any?> = emptyMap(),
         inMemoryDB: Boolean = true,
         dsl: RPCDriverDSL.() -> A
 ): A {
@@ -125,7 +133,8 @@ fun <A> rpcDriver(
                             notarySpecs = notarySpecs,
                             jmxPolicy = jmxPolicy,
                             compatibilityZone = null,
-                            maxTransactionSize = maxTransactionSize,
+                            networkParameters = networkParameters,
+                            notaryCustomOverrides = notaryCustomOverrides,
                             inMemoryDB = inMemoryDB
                     ), externalTrace
             ),
@@ -138,11 +147,11 @@ fun <A> rpcDriver(
 private class SingleUserSecurityManager(val rpcUser: User) : ActiveMQSecurityManager3 {
     override fun validateUser(user: String?, password: String?) = isValid(user, password)
     override fun validateUserAndRole(user: String?, password: String?, roles: MutableSet<Role>?, checkType: CheckType?) = isValid(user, password)
-    override fun validateUser(user: String?, password: String?, connection: Connection?): String? {
+    override fun validateUser(user: String?, password: String?, connection: RemotingConnection?): String? {
         return validate(user, password)
     }
 
-    override fun validateUserAndRole(user: String?, password: String?, roles: MutableSet<Role>?, checkType: CheckType?, address: String?, connection: Connection?): String? {
+    override fun validateUserAndRole(user: String?, password: String?, roles: MutableSet<Role>?, checkType: CheckType?, address: String?, connection: RemotingConnection?): String? {
         return validate(user, password)
     }
 
@@ -159,7 +168,7 @@ data class RPCDriverDSL(
         private val driverDSL: DriverDSLImpl, private val externalTrace: Trace?
 ) : InternalDriverDSL by driverDSL {
     private companion object {
-        val notificationAddress = "notifications"
+        const val notificationAddress = "notifications"
 
         private fun ConfigurationImpl.configureCommonSettings(maxFileSize: Int, maxBufferedBytesPerClient: Long) {
             managementNotificationAddress = SimpleString(notificationAddress)
@@ -203,20 +212,19 @@ data class RPCDriverDSL(
         }
 
         fun createRpcServerArtemisConfig(maxFileSize: Int, maxBufferedBytesPerClient: Long, baseDirectory: Path, hostAndPort: NetworkHostAndPort): Configuration {
-            val connectionDirection = ConnectionDirection.Inbound(acceptorFactoryClassName = NettyAcceptorFactory::class.java.name)
             return ConfigurationImpl().apply {
                 val artemisDir = "$baseDirectory/artemis"
                 bindingsDirectory = "$artemisDir/bindings"
                 journalDirectory = "$artemisDir/journal"
                 largeMessagesDirectory = "$artemisDir/large-messages"
-                acceptorConfigurations = setOf(ArtemisTcpTransport.tcpTransport(connectionDirection, hostAndPort, null))
+                acceptorConfigurations = setOf(ArtemisTcpTransport.rpcAcceptorTcpTransport(hostAndPort, null))
                 configureCommonSettings(maxFileSize, maxBufferedBytesPerClient)
             }
         }
 
         val inVmClientTransportConfiguration = TransportConfiguration(InVMConnectorFactory::class.java.name)
         fun createNettyClientTransportConfiguration(hostAndPort: NetworkHostAndPort): TransportConfiguration {
-            return ArtemisTcpTransport.tcpTransport(ConnectionDirection.Outbound(), hostAndPort, null)
+            return ArtemisTcpTransport.rpcConnectorTcpTransport(hostAndPort, null)
         }
     }
 
@@ -253,7 +261,7 @@ data class RPCDriverDSL(
             rpcOpsClass: Class<I>,
             username: String = rpcTestUser.username,
             password: String = rpcTestUser.password,
-            configuration: RPCClientConfiguration = RPCClientConfiguration.default
+            configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
     ): CordaFuture<I> {
         return driverDSL.executorService.fork {
             val client = RPCClient<I>(inVmClientTransportConfiguration, configuration)
@@ -324,10 +332,36 @@ data class RPCDriverDSL(
             rpcAddress: NetworkHostAndPort,
             username: String = rpcTestUser.username,
             password: String = rpcTestUser.password,
-            configuration: RPCClientConfiguration = RPCClientConfiguration.default
+            configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
     ): CordaFuture<I> {
         return driverDSL.executorService.fork {
-            val client = RPCClient<I>(ArtemisTcpTransport.tcpTransport(ConnectionDirection.Outbound(), rpcAddress, null), configuration)
+            val client = RPCClient<I>(ArtemisTcpTransport.rpcConnectorTcpTransport(rpcAddress, null), configuration)
+            val connection = client.start(rpcOpsClass, username, password, externalTrace)
+            driverDSL.shutdownManager.registerShutdown {
+                connection.close()
+            }
+            connection.proxy
+        }
+    }
+
+    /**
+     * Starts a Netty RPC client.
+     *
+     * @param rpcOpsClass The [Class] of the RPC interface.
+     * @param haAddressPool The addresses of the RPC servers(configured in HA mode) to connect to.
+     * @param username The username to authenticate with.
+     * @param password The password to authenticate with.
+     * @param configuration The RPC client configuration.
+     */
+    fun <I : RPCOps> startRpcClient(
+            rpcOpsClass: Class<I>,
+            haAddressPool: List<NetworkHostAndPort>,
+            username: String = rpcTestUser.username,
+            password: String = rpcTestUser.password,
+            configuration: CordaRPCClientConfigurationImpl = CordaRPCClientConfigurationImpl.default
+    ): CordaFuture<I> {
+        return driverDSL.executorService.fork {
+            val client = RPCClient<I>(haAddressPool, null, configuration)
             val connection = client.start(rpcOpsClass, username, password, externalTrace)
             driverDSL.shutdownManager.registerShutdown {
                 connection.close()
@@ -478,8 +512,8 @@ class RandomRpcUser {
             val hostAndPort = NetworkHostAndPort.parse(args[1])
             val username = args[2]
             val password = args[3]
-            KryoClientSerializationScheme.initialiseSerialization()
-            val handle = RPCClient<RPCOps>(hostAndPort, null, serializationContext = KRYO_RPC_CLIENT_CONTEXT).start(rpcClass, username, password)
+            AMQPClientSerializationScheme.initialiseSerialization()
+            val handle = RPCClient<RPCOps>(hostAndPort, null, serializationContext = AMQP_RPC_CLIENT_CONTEXT).start(rpcClass, username, password)
             val callGenerators = rpcClass.declaredMethods.map { method ->
                 Generator.sequence(method.parameters.map {
                     generatorStore[it.type] ?: throw Exception("No generator for ${it.type}")

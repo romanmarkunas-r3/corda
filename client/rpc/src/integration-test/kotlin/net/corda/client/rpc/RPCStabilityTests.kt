@@ -1,7 +1,7 @@
 package net.corda.client.rpc
 
 import net.corda.client.rpc.internal.RPCClient
-import net.corda.client.rpc.internal.RPCClientConfiguration
+import net.corda.client.rpc.internal.CordaRPCClientConfigurationImpl
 import net.corda.core.context.Trace
 import net.corda.core.crypto.random63BitValue
 import net.corda.core.internal.concurrent.fork
@@ -12,13 +12,15 @@ import net.corda.core.serialization.serialize
 import net.corda.core.utilities.*
 import net.corda.node.services.messaging.RPCServerConfiguration
 import net.corda.nodeapi.RPCApi
+import net.corda.nodeapi.eventually
 import net.corda.testing.core.SerializationEnvironmentRule
-import net.corda.testing.internal.*
+import net.corda.testing.core.freePort
+import net.corda.testing.internal.testThreadFactory
 import net.corda.testing.node.internal.*
+import org.apache.activemq.artemis.api.config.ActiveMQDefaultConfiguration
 import org.apache.activemq.artemis.api.core.SimpleString
 import org.junit.After
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
+import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 import rx.Observable
@@ -30,6 +32,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class RPCStabilityTests {
     @Rule
@@ -45,15 +48,15 @@ class RPCStabilityTests {
         override val protocolVersion = 0
     }
 
-    private fun waitUntilNumberOfThreadsStable(executorService: ScheduledExecutorService): Int {
-        val values = ConcurrentLinkedQueue<Int>()
+    private fun waitUntilNumberOfThreadsStable(executorService: ScheduledExecutorService): Map<Thread, List<StackTraceElement>> {
+        val values = ConcurrentLinkedQueue<Map<Thread, List<StackTraceElement>>>()
         return poll(executorService, "number of threads to become stable", 250.millis) {
-            values.add(Thread.activeCount())
+            values.add(Thread.getAllStackTraces().mapValues { it.value.toList() })
             if (values.size > 5) {
                 values.poll()
             }
             val first = values.peek()
-            if (values.size == 5 && values.all { it == first }) {
+            if (values.size == 5 && values.all { it.keys.size == first.keys.size }) {
                 first
             } else {
                 null
@@ -63,30 +66,39 @@ class RPCStabilityTests {
 
     @Test
     fun `client and server dont leak threads`() {
-        val executor = Executors.newScheduledThreadPool(1)
         fun startAndStop() {
             rpcDriver {
                 val server = startRpcServer<RPCOps>(ops = DummyOps).get()
                 startRpcClient<RPCOps>(server.broker.hostAndPort!!).get()
             }
         }
-        repeat(5) {
-            startAndStop()
+
+        runBlockAndCheckThreads(::startAndStop)
+    }
+
+    private fun runBlockAndCheckThreads(block: () -> Unit) {
+        val executor = Executors.newScheduledThreadPool(1)
+
+        try {
+            // Warm-up so that all the thread pools & co. created
+            block()
+
+            val threadsBefore = waitUntilNumberOfThreadsStable(executor)
+            repeat(5) {
+                block()
+            }
+            val threadsAfter = waitUntilNumberOfThreadsStable(executor)
+            // This is a less than check because threads from other tests may be shutting down while this test is running.
+            // This is therefore a "best effort" check. When this test is run on its own this should be a strict equality.
+            // In case of failure we output the threads along with their stacktraces to get an idea what was running at a time.
+            assert(threadsBefore.keys.size >= threadsAfter.keys.size, { "threadsBefore: $threadsBefore\nthreadsAfter: $threadsAfter" })
+        } finally {
+            executor.shutdownNow()
         }
-        val numberOfThreadsBefore = waitUntilNumberOfThreadsStable(executor)
-        repeat(5) {
-            startAndStop()
-        }
-        val numberOfThreadsAfter = waitUntilNumberOfThreadsStable(executor)
-        // This is a less than check because threads from other tests may be shutting down while this test is running.
-        // This is therefore a "best effort" check. When this test is run on its own this should be a strict equality.
-        assertTrue(numberOfThreadsBefore >= numberOfThreadsAfter)
-        executor.shutdownNow()
     }
 
     @Test
     fun `client doesnt leak threads when it fails to start`() {
-        val executor = Executors.newScheduledThreadPool(1)
         fun startAndStop() {
             rpcDriver {
                 Try.on { startRpcClient<RPCOps>(NetworkHostAndPort("localhost", 9999)).get() }
@@ -94,25 +106,15 @@ class RPCStabilityTests {
                 Try.on {
                     startRpcClient<RPCOps>(
                             server.get().broker.hostAndPort!!,
-                            configuration = RPCClientConfiguration.default.copy(minimumServerProtocolVersion = 1)
+                            configuration = CordaRPCClientConfigurationImpl.default.copy(minimumServerProtocolVersion = 1)
                     ).get()
                 }
             }
         }
-        repeat(5) {
-            startAndStop()
-        }
-        val numberOfThreadsBefore = waitUntilNumberOfThreadsStable(executor)
-        repeat(5) {
-            startAndStop()
-        }
-        val numberOfThreadsAfter = waitUntilNumberOfThreadsStable(executor)
-
-        assertTrue(numberOfThreadsBefore >= numberOfThreadsAfter)
-        executor.shutdownNow()
+        runBlockAndCheckThreads(::startAndStop)
     }
 
-    fun RpcBrokerHandle.getStats(): Map<String, Any> {
+    private fun RpcBrokerHandle.getStats(): Map<String, Any> {
         return serverControl.run {
             mapOf(
                     "connections" to listConnectionIDs().toSet(),
@@ -127,7 +129,7 @@ class RPCStabilityTests {
         rpcDriver {
             fun startAndCloseServer(broker: RpcBrokerHandle) {
                 startRpcServerWithBrokerRunning(
-                        configuration = RPCServerConfiguration.default.copy(consumerPoolSize = 1, producerPoolBound = 1),
+                        configuration = RPCServerConfiguration.default,
                         ops = DummyOps,
                         brokerHandle = broker
                 ).rpcServer.close()
@@ -148,7 +150,7 @@ class RPCStabilityTests {
     @Test
     fun `rpc client close doesnt leak broker resources`() {
         rpcDriver {
-            val server = startRpcServer(configuration = RPCServerConfiguration.default.copy(consumerPoolSize = 1, producerPoolBound = 1), ops = DummyOps).get()
+            val server = startRpcServer(configuration = RPCServerConfiguration.default, ops = DummyOps).get()
             RPCClient<RPCOps>(server.broker.hostAndPort!!).start(RPCOps::class.java, rpcTestUser.username, rpcTestUser.password).close()
             val initial = server.broker.getStats()
             repeat(100) {
@@ -210,14 +212,14 @@ class RPCStabilityTests {
             val server = startRpcServer<LeakObservableOps>(ops = leakObservableOpsImpl)
             val proxy = startRpcClient<LeakObservableOps>(server.get().broker.hostAndPort!!).get()
             // Leak many observables
-            val N = 200
-            (1..N).map {
+            val count = 200
+            (1..count).map {
                 pool.fork { proxy.leakObservable(); Unit }
             }.transpose().getOrThrow()
             // In a loop force GC and check whether the server is notified
             while (true) {
                 System.gc()
-                if (leakObservableOpsImpl.leakedUnsubscribedCount.get() == N) break
+                if (leakObservableOpsImpl.leakedUnsubscribedCount.get() == count) break
                 Thread.sleep(100)
             }
         }
@@ -239,16 +241,193 @@ class RPCStabilityTests {
             val serverPort = startRpcServer<ReconnectOps>(ops = ops).getOrThrow().broker.hostAndPort!!
             serverFollower.unfollow()
             // Set retry interval to 1s to reduce test duration
-            val clientConfiguration = RPCClientConfiguration.default.copy(connectionRetryInterval = 1.seconds)
+            val clientConfiguration = CordaRPCClientConfigurationImpl.default.copy(connectionRetryInterval = 1.seconds)
             val clientFollower = shutdownManager.follower()
             val client = startRpcClient<ReconnectOps>(serverPort, configuration = clientConfiguration).getOrThrow()
             clientFollower.unfollow()
             assertEquals("pong", client.ping())
             serverFollower.shutdown()
             startRpcServer<ReconnectOps>(ops = ops, customPort = serverPort).getOrThrow()
-            val pingFuture = pool.fork(client::ping)
-            assertEquals("pong", pingFuture.getOrThrow(10.seconds))
+            val response = eventually<RPCException, String>(10.seconds) { client.ping() }
+            assertEquals("pong", response)
             clientFollower.shutdown() // Driver would do this after the new server, causing hang.
+        }
+    }
+
+    @Test
+    fun `connection failover fails, rpc calls throw`() {
+        rpcDriver {
+            val ops = object : ReconnectOps {
+                override val protocolVersion = 0
+                override fun ping() = "pong"
+            }
+
+            val serverFollower = shutdownManager.follower()
+            val serverPort = startRpcServer<ReconnectOps>(ops = ops).getOrThrow().broker.hostAndPort!!
+            serverFollower.unfollow()
+            // Set retry interval to 1s to reduce test duration
+            val clientConfiguration = CordaRPCClientConfigurationImpl.default.copy(connectionRetryInterval = 1.seconds, maxReconnectAttempts = 5)
+            val clientFollower = shutdownManager.follower()
+            val client = startRpcClient<ReconnectOps>(serverPort, configuration = clientConfiguration).getOrThrow()
+            clientFollower.unfollow()
+            assertEquals("pong", client.ping())
+            serverFollower.shutdown()
+            try {
+                client.ping()
+            } catch (e: Exception) {
+                assertTrue(e is RPCException)
+            }
+            clientFollower.shutdown() // Driver would do this after the new server, causing hang.
+        }
+    }
+
+    interface NoOps : RPCOps {
+        fun subscribe(): Observable<Nothing>
+    }
+
+    @Test
+    fun `observables error when connection breaks`() {
+        rpcDriver {
+            val ops = object : NoOps {
+                override val protocolVersion = 0
+                override fun subscribe(): Observable<Nothing> {
+                    return PublishSubject.create<Nothing>()
+                }
+            }
+            val serverFollower = shutdownManager.follower()
+            val serverPort = startRpcServer<NoOps>(ops = ops).getOrThrow().broker.hostAndPort!!
+            serverFollower.unfollow()
+
+            val clientConfiguration = CordaRPCClientConfigurationImpl.default.copy(connectionRetryInterval = 500.millis, maxReconnectAttempts = 1)
+            val clientFollower = shutdownManager.follower()
+            val client = startRpcClient<NoOps>(serverPort, configuration = clientConfiguration).getOrThrow()
+            clientFollower.unfollow()
+
+            var terminateHandlerCalled = false
+            var errorHandlerCalled = false
+            var exceptionMessage: String? = null
+            val subscription = client.subscribe()
+                     .doOnTerminate{ terminateHandlerCalled = true }
+                     .subscribe({}, {
+                         errorHandlerCalled = true
+                         //log exception
+                         exceptionMessage = it.message
+                     })
+
+            serverFollower.shutdown()
+            Thread.sleep(100)
+
+            assertTrue(terminateHandlerCalled)
+            assertTrue(errorHandlerCalled)
+            assertEquals("Connection failure detected.", exceptionMessage)
+            assertTrue(subscription.isUnsubscribed)
+
+            clientFollower.shutdown() // Driver would do this after the new server, causing hang.
+        }
+    }
+
+    @Test
+    fun `client throws RPCException after initial connection attempt fails`() {
+        val client = CordaRPCClient(NetworkHostAndPort("localhost", freePort()))
+        var exceptionMessage: String? = null
+        try {
+           client.start("user", "pass").proxy
+        } catch (e1: RPCException) {
+            exceptionMessage = e1.message
+        } catch (e2: Exception) {
+            fail("Expected RPCException to be thrown. Received ${e2.javaClass.simpleName} instead.")
+        }
+        assertNotNull(exceptionMessage)
+        assertEquals("Cannot connect to server(s). Tried with all available servers.", exceptionMessage)
+    }
+
+    interface ServerOps : RPCOps {
+        fun serverId(): String
+    }
+
+    @Test
+    fun `client connects to first available server`() {
+        rpcDriver {
+            val ops = object : ServerOps {
+                override val protocolVersion = 0
+                override fun serverId() = "server"
+            }
+            val serverFollower = shutdownManager.follower()
+            val serverAddress = startRpcServer<RPCOps>(ops = ops).getOrThrow().broker.hostAndPort!!
+            serverFollower.unfollow()
+
+            val clientFollower = shutdownManager.follower()
+            val client = startRpcClient<ServerOps>(listOf(NetworkHostAndPort("localhost", 12345), serverAddress, NetworkHostAndPort("localhost", 54321))).getOrThrow()
+            clientFollower.unfollow()
+
+            assertEquals("server", client.serverId())
+
+            clientFollower.shutdown() // Driver would do this after the new server, causing hang.
+        }
+    }
+
+    @Test
+    fun `3 server failover`() {
+        rpcDriver {
+            val ops1 = object : ServerOps {
+                override val protocolVersion = 0
+                override fun serverId() = "server1"
+            }
+            val ops2 = object : ServerOps {
+                override val protocolVersion = 0
+                override fun serverId() = "server2"
+            }
+            val ops3 = object : ServerOps {
+                override val protocolVersion = 0
+                override fun serverId() = "server3"
+            }
+            val serverFollower1 = shutdownManager.follower()
+            val server1 = startRpcServer<RPCOps>(ops = ops1).getOrThrow()
+            serverFollower1.unfollow()
+
+            val serverFollower2 = shutdownManager.follower()
+            val server2 = startRpcServer<RPCOps>(ops = ops2).getOrThrow()
+            serverFollower2.unfollow()
+
+            val serverFollower3 = shutdownManager.follower()
+            val server3 = startRpcServer<RPCOps>(ops = ops3).getOrThrow()
+            serverFollower3.unfollow()
+            val servers = mutableMapOf("server1" to serverFollower1, "server2" to serverFollower2, "server3" to serverFollower3)
+
+            val clientFollower = shutdownManager.follower()
+            val client = startRpcClient<ServerOps>(listOf(server1.broker.hostAndPort!!, server2.broker.hostAndPort!!, server3.broker.hostAndPort!!)).getOrThrow()
+            clientFollower.unfollow()
+
+            var response = client.serverId()
+            assertTrue(servers.containsKey(response))
+            servers[response]!!.shutdown()
+            servers.remove(response)
+
+            // Failover will take some time.
+            while (true) {
+                try {
+                    response = client.serverId()
+                    break
+                } catch (e: RPCException) {}
+            }
+            assertTrue(servers.containsKey(response))
+            servers[response]!!.shutdown()
+            servers.remove(response)
+
+            while (true) {
+                try {
+                    response = client.serverId()
+                    break
+                } catch (e: RPCException) {}
+            }
+            assertTrue(servers.containsKey(response))
+            servers[response]!!.shutdown()
+            servers.remove(response)
+
+            assertTrue(servers.isEmpty())
+
+            clientFollower.shutdown() // Driver would do this after the new server, causing hang.
+
         }
     }
 
@@ -292,11 +471,11 @@ class RPCStabilityTests {
             clients[0].destroyForcibly()
             pollUntilClientNumber(server, numberOfClients - 1)
             // Kill the rest
-            (1..numberOfClients - 1).forEach {
+            (1 until numberOfClients).forEach {
                 clients[it].destroyForcibly()
             }
             pollUntilClientNumber(server, 0)
-            // Now poll until the server detects the disconnects and unsubscribes from all obserables.
+            // Now poll until the server detects the disconnects and un-subscribes from all observables.
             pollUntilTrue("number of times subscribe() has been called") { trackSubscriberOpsImpl.subscriberCount.get() == 0 }.get()
         }
     }
@@ -322,7 +501,7 @@ class RPCStabilityTests {
             // Construct an RPC session manually so that we can hang in the message handler
             val myQueue = "${RPCApi.RPC_CLIENT_QUEUE_NAME_PREFIX}.test.${random63BitValue()}"
             val session = startArtemisSession(server.broker.hostAndPort!!)
-            session.createTemporaryQueue(myQueue, myQueue)
+            session.createTemporaryQueue(myQueue, ActiveMQDefaultConfiguration.getDefaultRoutingType(), myQueue)
             val consumer = session.createConsumer(myQueue, null, -1, -1, false)
             consumer.setMessageHandler {
                 Thread.sleep(50) // 5x slower than the server producer
@@ -337,11 +516,12 @@ class RPCStabilityTests {
             val request = RPCApi.ClientToServer.RpcRequest(
                     clientAddress = SimpleString(myQueue),
                     methodName = SlowConsumerRPCOps::streamAtInterval.name,
-                    serialisedArguments = listOf(10.millis, 123456).serialize(context = SerializationDefaults.RPC_SERVER_CONTEXT).bytes,
+                    serialisedArguments = listOf(10.millis, 123456).serialize(context = SerializationDefaults.RPC_SERVER_CONTEXT),
                     replyId = Trace.InvocationId.newInstance(),
                     sessionId = Trace.SessionId.newInstance()
             )
             request.writeToClientMessage(message)
+            message.putLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME, 0)
             producer.send(message)
             session.commit()
 
@@ -350,6 +530,79 @@ class RPCStabilityTests {
         }
     }
 
+    @Test
+    fun `deduplication in the server`() {
+        rpcDriver {
+            val server = startRpcServer(ops = SlowConsumerRPCOpsImpl()).getOrThrow()
+
+            // Construct an RPC client session manually
+            val myQueue = "${RPCApi.RPC_CLIENT_QUEUE_NAME_PREFIX}.test.${random63BitValue()}"
+            val session = startArtemisSession(server.broker.hostAndPort!!)
+            session.createTemporaryQueue(myQueue, ActiveMQDefaultConfiguration.getDefaultRoutingType(), myQueue)
+            val consumer = session.createConsumer(myQueue, null, -1, -1, false)
+            val replies = ArrayList<Any>()
+            consumer.setMessageHandler {
+                replies.add(it)
+                it.acknowledge()
+            }
+
+            val producer = session.createProducer(RPCApi.RPC_SERVER_QUEUE_NAME)
+            session.start()
+
+            pollUntilClientNumber(server, 1)
+
+            val message = session.createMessage(false)
+            val request = RPCApi.ClientToServer.RpcRequest(
+                    clientAddress = SimpleString(myQueue),
+                    methodName = DummyOps::protocolVersion.name,
+                    serialisedArguments = emptyList<Any>().serialize(context = SerializationDefaults.RPC_SERVER_CONTEXT),
+                    replyId = Trace.InvocationId.newInstance(),
+                    sessionId = Trace.SessionId.newInstance()
+            )
+            request.writeToClientMessage(message)
+            message.putLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME, 0)
+            producer.send(message)
+            // duplicate the message
+            producer.send(message)
+
+            pollUntilTrue("Number of replies is 1") {
+                replies.size == 1
+            }.getOrThrow()
+        }
+    }
+
+    @Test
+    fun `deduplication in the client`() {
+        rpcDriver {
+            val broker = startRpcBroker().getOrThrow()
+
+            // Construct an RPC server session manually
+            val session = startArtemisSession(broker.hostAndPort!!)
+            val consumer = session.createConsumer(RPCApi.RPC_SERVER_QUEUE_NAME)
+            val producer = session.createProducer()
+            val dedupeId = AtomicLong(0)
+            consumer.setMessageHandler {
+                it.acknowledge()
+                val request = RPCApi.ClientToServer.fromClientMessage(it)
+                when (request) {
+                    is RPCApi.ClientToServer.RpcRequest -> {
+                        val reply = RPCApi.ServerToClient.RpcReply(request.replyId, Try.Success(0), "server")
+                        val message = session.createMessage(false)
+                        reply.writeToClientMessage(SerializationDefaults.RPC_SERVER_CONTEXT, message)
+                        message.putLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME, dedupeId.getAndIncrement())
+                        producer.send(request.clientAddress, message)
+                        // duplicate the reply
+                        producer.send(request.clientAddress, message)
+                    }
+                    is RPCApi.ClientToServer.ObservablesClosed -> {
+                    }
+                }
+            }
+            session.start()
+
+            startRpcClient<RPCOps>(broker.hostAndPort!!).getOrThrow()
+        }
+    }
 }
 
 fun RPCDriverDSL.pollUntilClientNumber(server: RpcServerHandle, expected: Int) {

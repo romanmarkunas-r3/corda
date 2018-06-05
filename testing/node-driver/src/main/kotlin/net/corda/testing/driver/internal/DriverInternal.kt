@@ -12,8 +12,11 @@ import net.corda.nodeapi.internal.persistence.CordaPersistence
 import net.corda.testing.driver.InProcess
 import net.corda.testing.driver.NodeHandle
 import net.corda.testing.driver.OutOfProcess
+import net.corda.testing.driver.PortAllocation
 import net.corda.testing.node.User
 import rx.Observable
+import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.nio.file.Path
 
 interface NodeHandleInternal : NodeHandle {
@@ -21,7 +24,8 @@ interface NodeHandleInternal : NodeHandle {
     val useHTTPS: Boolean
     val webAddress: NetworkHostAndPort
     override val p2pAddress: NetworkHostAndPort get() = configuration.p2pAddress
-    override val rpcAddress: NetworkHostAndPort get() = configuration.rpcOptions.address!!
+    override val rpcAddress: NetworkHostAndPort get() = configuration.rpcOptions.address
+    override val rpcAdminAddress: NetworkHostAndPort get() = configuration.rpcOptions.adminAddress
     override val baseDirectory: Path get() = configuration.baseDirectory
 }
 
@@ -57,7 +61,7 @@ data class InProcessImpl(
         private val onStopCallback: () -> Unit,
         private val node: StartedNode<Node>
 ) : InProcess, NodeHandleInternal {
-    override val database: CordaPersistence get() = node.database
+    val database: CordaPersistence = node.database
     override val services: StartedNodeServices get() = node.services
     override val rpcUsers: List<User> = configuration.rpcUsers.map { User(it.username, it.password, it.permissions) }
     override fun stop() {
@@ -71,4 +75,15 @@ data class InProcessImpl(
 
     override fun close() = stop()
     override fun <T : FlowLogic<*>> registerInitiatedFlow(initiatedFlowClass: Class<T>): Observable<T> = node.registerInitiatedFlow(initiatedFlowClass)
+}
+
+val InProcess.internalServices: StartedNodeServices get() = services as StartedNodeServices
+
+object RandomFree : PortAllocation() {
+    override fun nextPort(): Int {
+        return ServerSocket().use {
+            it.bind(InetSocketAddress(0))
+            it.localPort
+        }
+    }
 }

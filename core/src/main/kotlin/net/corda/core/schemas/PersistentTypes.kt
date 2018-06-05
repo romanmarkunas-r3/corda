@@ -42,6 +42,26 @@ open class MappedSchema(schemaFamily: Class<*>,
                         val mappedTypes: Iterable<Class<*>>) {
     val name: String = schemaFamily.name
     override fun toString(): String = "${this.javaClass.simpleName}(name=$name, version=$version)"
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as MappedSchema
+
+        if (version != other.version) return false
+        if (mappedTypes != other.mappedTypes) return false
+        if (name != other.name) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = version
+        result = 31 * result + mappedTypes.hashCode()
+        result = 31 * result + name.hashCode()
+        return result
+    }
 }
 //DOCEND MappedSchema
 
@@ -50,18 +70,19 @@ open class MappedSchema(schemaFamily: Class<*>,
  * [StateRef] will be set to the correct value by the framework (there's no need to set during mapping generation by the state itself).
  */
 @MappedSuperclass
-@CordaSerializable open class PersistentState(@EmbeddedId var stateRef: PersistentStateRef? = null) : StatePersistable
+@CordaSerializable
+class PersistentState(@EmbeddedId var stateRef: PersistentStateRef? = null) : StatePersistable
 
 /**
  * Embedded [StateRef] representation used in state mapping.
  */
 @Embeddable
 data class PersistentStateRef(
-        @Column(name = "transaction_id", length = 64)
-        var txId: String? = null,
+        @Column(name = "transaction_id", length = 64, nullable = false)
+        var txId: String,
 
-        @Column(name = "output_index")
-        var index: Int? = null
+        @Column(name = "output_index", nullable = false)
+        var index: Int
 ) : Serializable {
     constructor(stateRef: StateRef) : this(stateRef.txhash.bytes.toHexString(), stateRef.index)
 }
@@ -69,4 +90,4 @@ data class PersistentStateRef(
 /**
  * Marker interface to denote a persistable Corda state entity that will always have a transaction id and index
  */
-interface StatePersistable
+interface StatePersistable : Serializable

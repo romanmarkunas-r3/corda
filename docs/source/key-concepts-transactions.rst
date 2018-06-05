@@ -95,8 +95,10 @@ Each required signers should only sign the transaction if the following two cond
 
    * **Transaction validity**: For both the proposed transaction, and every transaction in the chain of transactions
      that created the current proposed transaction's inputs:
+
        * The transaction is digitally signed by all the required parties
        * The transaction is *contractually valid* (see :doc:`key-concepts-contracts`)
+
    * **Transaction uniqueness**: There exists no other committed transaction that has consumed any of the inputs to
      our proposed transaction (see :doc:`key-concepts-consensus`)
 
@@ -105,14 +107,14 @@ will not be valid, and will not be accepted as inputs to subsequent transactions
 
 Other transaction components
 ----------------------------
-As well as input states and output states, transactions may contain:
+As well as input states and output states, transactions contain:
 
 * Commands
 * Attachments
-* Timestamps
+* Time-Window
 
 For example, a transaction where Alice pays off £5 of an IOU with Bob using a £5 cash payment, supported by two
-attachments and a timestamp, may look as follows:
+attachments and a time-window, may look as follows:
 
 .. image:: resources/full-tx.png
    :scale: 25%
@@ -170,8 +172,8 @@ For this use case, we have *attachments*. Each transaction can refer to zero or 
 attachments are ZIP/JAR files containing arbitrary content. The information in these files can then be
 used when checking the transaction's validity.
 
-Time-windows
-^^^^^^^^^^^^
+Time-window
+^^^^^^^^^^^
 In some cases, we want a transaction proposed to only be approved during a certain time-window. For example:
 
 * An option can only be exercised after a certain date

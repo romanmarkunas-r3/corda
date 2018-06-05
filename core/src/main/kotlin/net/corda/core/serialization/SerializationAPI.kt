@@ -1,5 +1,6 @@
 package net.corda.core.serialization
 
+import net.corda.core.DoNotImplement
 import net.corda.core.crypto.SecureHash
 import net.corda.core.crypto.sha256
 import net.corda.core.serialization.internal.effectiveSerializationEnv
@@ -99,14 +100,22 @@ abstract class SerializationFactory {
     }
 }
 typealias SerializationMagic = ByteSequence
+@DoNotImplement
+interface SerializationEncoding
+
 /**
  * Parameters to serialization and deserialization.
  */
+@DoNotImplement
 interface SerializationContext {
     /**
      * When serializing, use the format this header sequence represents.
      */
     val preferredSerializationVersion: SerializationMagic
+    /**
+     * If non-null, apply this encoding (typically compression) when serializing.
+     */
+    val encoding: SerializationEncoding?
     /**
      * The class loader to use for deserialization.
      */
@@ -115,6 +124,10 @@ interface SerializationContext {
      * A whitelist that contains (mostly for security purposes) which classes can be serialized and deserialized.
      */
     val whitelist: ClassWhitelist
+    /**
+     * A whitelist that determines (mostly for security purposes) whether a particular encoding may be used when deserializing.
+     */
+    val encodingWhitelist: EncodingWhitelist
     /**
      * A map of any addition properties specific to the particular use case.
      */
@@ -162,9 +175,23 @@ interface SerializationContext {
     fun withPreferredSerializationVersion(magic: SerializationMagic): SerializationContext
 
     /**
+     * A shallow copy of this context but with the given (possibly null) encoding.
+     */
+    fun withEncoding(encoding: SerializationEncoding?): SerializationContext
+
+    /**
      * The use case that we are serializing for, since it influences the implementations chosen.
      */
-    enum class UseCase { P2P, RPCServer, RPCClient, Storage, Checkpoint }
+    enum class UseCase { P2P, RPCServer, RPCClient, Storage, Checkpoint, Testing }
+}
+
+/**
+ * Set of well known properties that may be set on a serialization context. This doesn't preclude
+ * others being set that aren't keyed on this enumeration, but for general use properties adding a
+ * well known key here is preferred.
+ */
+enum class ContextPropertyKeys {
+    SERIALIZERS
 }
 
 /**
@@ -182,7 +209,8 @@ object SerializationDefaults {
 /**
  * Convenience extension method for deserializing a ByteSequence, utilising the defaults.
  */
-inline fun <reified T : Any> ByteSequence.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory, context: SerializationContext = serializationFactory.defaultContext): T {
+inline fun <reified T : Any> ByteSequence.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
+                                                      context: SerializationContext = serializationFactory.defaultContext): T {
     return serializationFactory.deserialize(this, T::class.java, context)
 }
 
@@ -191,31 +219,40 @@ inline fun <reified T : Any> ByteSequence.deserialize(serializationFactory: Seri
  * It might be helpful to know [SerializationContext] to use the same encoding in the reply.
  */
 inline fun <reified T : Any> ByteSequence.deserializeWithCompatibleContext(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
-                                                                       context: SerializationContext = serializationFactory.defaultContext): ObjectWithCompatibleContext<T> {
+                                                                           context: SerializationContext = serializationFactory.defaultContext): ObjectWithCompatibleContext<T> {
     return serializationFactory.deserializeWithCompatibleContext(this, T::class.java, context)
 }
 
 /**
  * Convenience extension method for deserializing SerializedBytes with type matching, utilising the defaults.
  */
-inline fun <reified T : Any> SerializedBytes<T>.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory, context: SerializationContext = serializationFactory.defaultContext): T {
+inline fun <reified T : Any> SerializedBytes<T>.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
+                                                            context: SerializationContext = serializationFactory.defaultContext): T {
     return serializationFactory.deserialize(this, T::class.java, context)
 }
 
 /**
  * Convenience extension method for deserializing a ByteArray, utilising the defaults.
  */
-inline fun <reified T : Any> ByteArray.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory, context: SerializationContext = serializationFactory.defaultContext): T = this.sequence().deserialize(serializationFactory, context)
+inline fun <reified T : Any> ByteArray.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
+                                                   context: SerializationContext = serializationFactory.defaultContext): T {
+    require(isNotEmpty()) { "Empty bytes" }
+    return this.sequence().deserialize(serializationFactory, context)
+}
 
 /**
  * Convenience extension method for deserializing a JDBC Blob, utilising the defaults.
  */
-inline fun <reified T : Any> Blob.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory, context: SerializationContext = serializationFactory.defaultContext): T = this.getBytes(1, this.length().toInt()).deserialize(serializationFactory, context)
+inline fun <reified T : Any> Blob.deserialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
+                                              context: SerializationContext = serializationFactory.defaultContext): T {
+    return this.getBytes(1, this.length().toInt()).deserialize(serializationFactory, context)
+}
 
 /**
  * Convenience extension method for serializing an object of type T, utilising the defaults.
  */
-fun <T : Any> T.serialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory, context: SerializationContext = serializationFactory.defaultContext): SerializedBytes<T> {
+fun <T : Any> T.serialize(serializationFactory: SerializationFactory = SerializationFactory.defaultFactory,
+                          context: SerializationContext = serializationFactory.defaultContext): SerializedBytes<T> {
     return serializationFactory.serialize(this, context)
 }
 
@@ -231,4 +268,9 @@ class SerializedBytes<T : Any>(bytes: ByteArray) : OpaqueBytes(bytes) {
 
 interface ClassWhitelist {
     fun hasListed(type: Class<*>): Boolean
+}
+
+@DoNotImplement
+interface EncodingWhitelist {
+    fun acceptEncoding(encoding: SerializationEncoding): Boolean
 }

@@ -13,7 +13,6 @@ import net.corda.testing.core.*
 import net.corda.testing.node.InMemoryMessagingNetwork.ServicePeerAllocationStrategy.RoundRobin
 import net.corda.testing.node.MockNetwork
 import net.corda.testing.node.StartedMockNode
-import net.corda.testing.node.startFlow
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
@@ -34,7 +33,7 @@ class CashPaymentFlowTests {
         bankOfCordaNode = mockNet.createPartyNode(BOC_NAME)
         bankOfCorda = bankOfCordaNode.info.identityFromX500Name(BOC_NAME)
         aliceNode = mockNet.createPartyNode(ALICE_NAME)
-        val future = bankOfCordaNode.services.startFlow(CashIssueFlow(initialBalance, ref, mockNet.defaultNotaryIdentity))
+        val future = bankOfCordaNode.startFlow(CashIssueFlow(initialBalance, ref, mockNet.defaultNotaryIdentity))
         future.getOrThrow()
     }
 
@@ -45,17 +44,17 @@ class CashPaymentFlowTests {
 
     @Test
     fun `pay some cash`() {
-        val payTo = aliceNode.info.chooseIdentity()
+        val payTo = aliceNode.info.singleIdentity()
         val expectedPayment = 500.DOLLARS
         val expectedChange = 1500.DOLLARS
 
-        bankOfCordaNode.database.transaction {
+        bankOfCordaNode.transaction {
             // Register for vault updates
             val criteria = QueryCriteria.VaultQueryCriteria(status = Vault.StateStatus.ALL)
             val (_, vaultUpdatesBoc) = bankOfCordaNode.services.vaultService.trackBy<Cash.State>(criteria)
             val (_, vaultUpdatesBankClient) = aliceNode.services.vaultService.trackBy<Cash.State>(criteria)
 
-            val future = bankOfCordaNode.services.startFlow(CashPaymentFlow(expectedPayment, payTo))
+            val future = bankOfCordaNode.startFlow(CashPaymentFlow(expectedPayment, payTo))
             mockNet.runNetwork()
             future.getOrThrow()
 
@@ -84,9 +83,9 @@ class CashPaymentFlowTests {
 
     @Test
     fun `pay more than we have`() {
-        val payTo = aliceNode.info.chooseIdentity()
+        val payTo = aliceNode.info.singleIdentity()
         val expected = 4000.DOLLARS
-        val future = bankOfCordaNode.services.startFlow(CashPaymentFlow(expected,
+        val future = bankOfCordaNode.startFlow(CashPaymentFlow(expected,
                 payTo))
         mockNet.runNetwork()
         assertFailsWith<CashException> {
@@ -96,9 +95,9 @@ class CashPaymentFlowTests {
 
     @Test
     fun `pay zero cash`() {
-        val payTo = aliceNode.info.chooseIdentity()
+        val payTo = aliceNode.info.singleIdentity()
         val expected = 0.DOLLARS
-        val future = bankOfCordaNode.services.startFlow(CashPaymentFlow(expected,
+        val future = bankOfCordaNode.startFlow(CashPaymentFlow(expected,
                 payTo))
         mockNet.runNetwork()
         assertFailsWith<IllegalArgumentException> {

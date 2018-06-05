@@ -11,17 +11,21 @@ import net.corda.core.identity.groupAbstractPartyByWellKnownParty
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.utilities.getOrThrow
+import net.corda.node.internal.StartedNode
 import net.corda.testing.contracts.DummyContract
-import net.corda.testing.core.*
+import net.corda.testing.core.ALICE_NAME
+import net.corda.testing.core.BOB_NAME
+import net.corda.testing.core.CHARLIE_NAME
+import net.corda.testing.core.TestIdentity
+import net.corda.testing.core.singleIdentity
 import net.corda.testing.internal.rigorousMock
-import net.corda.testing.node.MockNetwork
-import net.corda.testing.node.StartedMockNode
 import net.corda.testing.node.MockServices
-import net.corda.testing.node.startFlow
+import net.corda.testing.node.internal.InternalMockNetwork
+import net.corda.testing.node.internal.InternalMockNetwork.MockNode
+import net.corda.testing.node.internal.startFlow
 import org.junit.After
 import org.junit.Before
 import org.junit.Test
-import kotlin.reflect.KClass
 import kotlin.test.assertFailsWith
 
 class CollectSignaturesFlowTests {
@@ -29,10 +33,10 @@ class CollectSignaturesFlowTests {
         private val miniCorp = TestIdentity(CordaX500Name("MiniCorp", "London", "GB"))
     }
 
-    private lateinit var mockNet: MockNetwork
-    private lateinit var aliceNode: StartedMockNode
-    private lateinit var bobNode: StartedMockNode
-    private lateinit var charlieNode: StartedMockNode
+    private lateinit var mockNet: InternalMockNetwork
+    private lateinit var aliceNode: StartedNode<MockNode>
+    private lateinit var bobNode: StartedNode<MockNode>
+    private lateinit var charlieNode: StartedNode<MockNode>
     private lateinit var alice: Party
     private lateinit var bob: Party
     private lateinit var charlie: Party
@@ -40,7 +44,7 @@ class CollectSignaturesFlowTests {
 
     @Before
     fun setup() {
-        mockNet = MockNetwork(cordappPackages = listOf("net.corda.testing.contracts"))
+        mockNet = InternalMockNetwork(cordappPackages = listOf("net.corda.testing.contracts", "net.corda.core.flows"))
         aliceNode = mockNet.createPartyNode(ALICE_NAME)
         bobNode = mockNet.createPartyNode(BOB_NAME)
         charlieNode = mockNet.createPartyNode(CHARLIE_NAME)
@@ -53,12 +57,6 @@ class CollectSignaturesFlowTests {
     @After
     fun tearDown() {
         mockNet.stopNodes()
-    }
-
-    private fun registerFlowOnAllNodes(flowClass: KClass<out FlowLogic<*>>) {
-        listOf(aliceNode, bobNode, charlieNode).forEach {
-            it.registerInitiatedFlow(flowClass.java)
-        }
     }
 
     // With this flow, the initiator starts the "CollectTransactionFlow". It is then the responders responsibility to
@@ -81,9 +79,11 @@ class CollectSignaturesFlowTests {
 
         @InitiatedBy(TestFlow.Initiator::class)
         class Responder(private val otherSideSession: FlowSession) : FlowLogic<Unit>() {
-            @Suspendable override fun call() {
+            @Suspendable
+            override fun call() {
                 val signFlow = object : SignTransactionFlow(otherSideSession) {
-                    @Suspendable override fun checkTransaction(stx: SignedTransaction) = requireThat {
+                    @Suspendable
+                    override fun checkTransaction(stx: SignedTransaction) = requireThat {
                         val tx = stx.tx
                         val ltx = tx.toLedgerTransaction(serviceHub)
                         "There should only be one output state" using (tx.outputs.size == 1)
@@ -109,13 +109,12 @@ class CollectSignaturesFlowTests {
             // Normally this is handled by TransactionKeyFlow, but here we have to manually let A know about the identity
             aliceNode.services.identityService.verifyAndRegisterIdentity(bConfidentialIdentity)
         }
-        registerFlowOnAllNodes(TestFlow.Responder::class)
         val magicNumber = 1337
         val parties = listOf(alice, bConfidentialIdentity.party, charlie)
         val state = DummyContract.MultiOwnerState(magicNumber, parties)
         val flow = aliceNode.services.startFlow(TestFlow.Initiator(state, notary))
         mockNet.runNetwork()
-        val result = flow.getOrThrow()
+        val result = flow.resultFuture.getOrThrow()
         result.verifyRequiredSignatures()
         println(result.tx)
         println(result.sigs)
@@ -127,7 +126,7 @@ class CollectSignaturesFlowTests {
         val ptx = aliceNode.services.signInitialTransaction(onePartyDummyContract)
         val flow = aliceNode.services.startFlow(CollectSignaturesFlow(ptx, emptySet()))
         mockNet.runNetwork()
-        val result = flow.getOrThrow()
+        val result = flow.resultFuture.getOrThrow()
         result.verifyRequiredSignatures()
         println(result.tx)
         println(result.sigs)
@@ -141,7 +140,7 @@ class CollectSignaturesFlowTests {
         val flow = aliceNode.services.startFlow(CollectSignaturesFlow(ptx, emptySet()))
         mockNet.runNetwork()
         assertFailsWith<IllegalArgumentException>("The Initiator of CollectSignaturesFlow must have signed the transaction.") {
-            flow.getOrThrow()
+            flow.resultFuture.getOrThrow()
         }
     }
 
@@ -155,7 +154,7 @@ class CollectSignaturesFlowTests {
         val signedByBoth = bobNode.services.addSignature(signedByA)
         val flow = aliceNode.services.startFlow(CollectSignaturesFlow(signedByBoth, emptySet()))
         mockNet.runNetwork()
-        val result = flow.getOrThrow()
+        val result = flow.resultFuture.getOrThrow()
         println(result.tx)
         println(result.sigs)
     }

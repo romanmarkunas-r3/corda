@@ -3,18 +3,30 @@ package net.corda.node.services.statemachine
 import co.paralleluniverse.fibers.Suspendable
 import net.corda.client.rpc.CordaRPCClient
 import net.corda.core.crypto.SecureHash
-import net.corda.core.flows.*
+import net.corda.core.flows.FlowLogic
+import net.corda.core.flows.FlowSession
+import net.corda.core.flows.InitiatedBy
+import net.corda.core.flows.InitiatingFlow
+import net.corda.core.flows.ReceiveTransactionFlow
+import net.corda.core.flows.SendTransactionFlow
+import net.corda.core.flows.StartableByRPC
 import net.corda.core.internal.InputStreamAndHash
 import net.corda.core.internal.concurrent.transpose
 import net.corda.core.messaging.startFlow
 import net.corda.core.transactions.TransactionBuilder
 import net.corda.core.utilities.getOrThrow
+import net.corda.node.services.config.MB
+import net.corda.testing.common.internal.testNetworkParameters
 import net.corda.testing.contracts.DummyContract
 import net.corda.testing.contracts.DummyState
-import net.corda.testing.core.*
+import net.corda.testing.core.ALICE_NAME
+import net.corda.testing.core.BOB_NAME
+import net.corda.testing.core.DUMMY_NOTARY_NAME
+import net.corda.testing.core.TestIdentity
+import net.corda.testing.core.dummyCommand
 import net.corda.testing.driver.DriverParameters
-import net.corda.testing.driver.PortAllocation
 import net.corda.testing.driver.driver
+import net.corda.testing.driver.internal.RandomFree
 import net.corda.testing.node.User
 import org.junit.Test
 import kotlin.test.assertEquals
@@ -68,11 +80,15 @@ class LargeTransactionsTest {
     fun checkCanSendLargeTransactions() {
         // These 4 attachments yield a transaction that's got >10mb attached, so it'd push us over the Artemis
         // max message size.
-        val bigFile1 = InputStreamAndHash.createInMemoryTestZip(1024 * 1024 * 3, 0)
-        val bigFile2 = InputStreamAndHash.createInMemoryTestZip(1024 * 1024 * 3, 1)
-        val bigFile3 = InputStreamAndHash.createInMemoryTestZip(1024 * 1024 * 3, 2)
-        val bigFile4 = InputStreamAndHash.createInMemoryTestZip(1024 * 1024 * 3, 3)
-        driver(DriverParameters(startNodesInProcess = true, extraCordappPackagesToScan = listOf("net.corda.testing.contracts"), portAllocation = PortAllocation.RandomFree)) {
+        val bigFile1 = InputStreamAndHash.createInMemoryTestZip(3.MB.toInt(), 0)
+        val bigFile2 = InputStreamAndHash.createInMemoryTestZip(3.MB.toInt(), 1)
+        val bigFile3 = InputStreamAndHash.createInMemoryTestZip(3.MB.toInt(), 2)
+        val bigFile4 = InputStreamAndHash.createInMemoryTestZip(3.MB.toInt(), 3)
+        driver(DriverParameters(
+                startNodesInProcess = true,
+                extraCordappPackagesToScan = listOf("net.corda.testing.contracts"),
+                networkParameters = testNetworkParameters(maxTransactionSize = 13.MB.toInt()),
+                portAllocation = RandomFree)) {
             val rpcUser = User("admin", "admin", setOf("ALL"))
             val (alice, _) = listOf(ALICE_NAME, BOB_NAME).map { startNode(providedName = it, rpcUsers = listOf(rpcUser)) }.transpose().getOrThrow()
             CordaRPCClient(alice.rpcAddress).use(rpcUser.username, rpcUser.password) {

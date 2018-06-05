@@ -3,6 +3,7 @@ package net.corda.bank
 import joptsimple.OptionParser
 import net.corda.bank.api.BankOfCordaClientApi
 import net.corda.bank.api.BankOfCordaWebApi.IssueRequestParams
+import net.corda.cordform.CordappDependency
 import net.corda.cordform.CordformContext
 import net.corda.cordform.CordformDefinition
 import net.corda.core.contracts.Amount
@@ -25,8 +26,8 @@ private const val BOC_RPC_ADMIN_PORT = 10015
 private const val BOC_WEB_PORT = 10007
 
 class BankOfCordaCordform : CordformDefinition() {
+
     init {
-        cordappPackages += "net.corda.finance"
         node {
             name(NOTARY_NAME)
             notary(NotaryConfig(validating = true))
@@ -35,10 +36,11 @@ class BankOfCordaCordform : CordformDefinition() {
                 address("localhost:10003")
                 adminAddress("localhost:10004")
             }
+            devMode(true)
         }
         node {
             name(BOC_NAME)
-            extraConfig = mapOf("issuableCurrencies" to listOf("USD"))
+            extraConfig = mapOf("custom" to mapOf("issuableCurrencies" to listOf("USD")))
             p2pPort(10005)
             rpcSettings {
                 address("localhost:$BOC_RPC_PORT")
@@ -46,6 +48,7 @@ class BankOfCordaCordform : CordformDefinition() {
             }
             webPort(BOC_WEB_PORT)
             rpcUsers(User("bankUser", "test", setOf(all())))
+            devMode(true)
         }
         node {
             name(BIGCORP_NAME)
@@ -56,16 +59,21 @@ class BankOfCordaCordform : CordformDefinition() {
             }
             webPort(10010)
             rpcUsers(User("bigCorpUser", "test", setOf(all())))
+            devMode(true)
         }
     }
 
     override fun setup(context: CordformContext) = Unit
+
+    override fun getCordappDependencies(): List<CordappDependency> {
+        return listOf(CordappDependency(":finance"))
+    }
 }
 
 object DeployNodes {
     @JvmStatic
     fun main(args: Array<String>) {
-        BankOfCordaCordform().deployNodes()
+        BankOfCordaCordform().nodeRunner().scanPackages(listOf("net.corda.finance")).deployAndRunNodes()
     }
 }
 

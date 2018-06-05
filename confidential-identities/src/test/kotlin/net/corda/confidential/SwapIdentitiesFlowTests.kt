@@ -3,19 +3,19 @@ package net.corda.confidential
 import net.corda.core.identity.*
 import net.corda.core.utilities.getOrThrow
 import net.corda.testing.core.*
-import net.corda.testing.node.MockNetwork
+import net.corda.testing.node.internal.InternalMockNetwork
+import net.corda.testing.node.internal.startFlow
 import org.junit.Before
-import net.corda.testing.node.startFlow
 import org.junit.Test
 import kotlin.test.*
 
 class SwapIdentitiesFlowTests {
-    private lateinit var mockNet: MockNetwork
+    private lateinit var mockNet: InternalMockNetwork
 
     @Before
     fun setup() {
         // We run this in parallel threads to help catch any race conditions that may exist.
-        mockNet = MockNetwork(emptyList(), networkSendManuallyPumped = false, threadPerNode = true)
+        mockNet = InternalMockNetwork(emptyList(), networkSendManuallyPumped = false, threadPerNode = true)
     }
 
     @Test
@@ -27,7 +27,7 @@ class SwapIdentitiesFlowTests {
         val bob = bobNode.services.myInfo.singleIdentity()
 
         // Run the flows
-        val requesterFlow = aliceNode.services.startFlow(SwapIdentitiesFlow(bob))
+        val requesterFlow = aliceNode.services.startFlow(SwapIdentitiesFlow(bob)).resultFuture
 
         // Get the results
         val actual: Map<Party, AnonymousParty> = requesterFlow.getOrThrow().toMap()
@@ -62,7 +62,7 @@ class SwapIdentitiesFlowTests {
         val charlieNode = mockNet.createPartyNode(CHARLIE_NAME)
         val bob: Party = bobNode.services.myInfo.singleIdentity()
         val notBob = charlieNode.database.transaction {
-            charlieNode.services.keyManagementService.freshKeyAndCert(charlieNode.services.myInfo.chooseIdentityAndCert(), false)
+            charlieNode.services.keyManagementService.freshKeyAndCert(charlieNode.services.myInfo.singleIdentityAndCert(), false)
         }
         val sigData = SwapIdentitiesFlow.buildDataToSign(notBob)
         val signature = charlieNode.services.keyManagementService.sign(sigData, notBob.owningKey)

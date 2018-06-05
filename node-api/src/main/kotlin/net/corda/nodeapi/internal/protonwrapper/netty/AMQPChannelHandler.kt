@@ -38,9 +38,10 @@ internal class AMQPChannelHandler(private val serverMode: Boolean,
                                   private val onReceive: (ReceivedMessage) -> Unit) : ChannelDuplexHandler() {
     private val log = LoggerFactory.getLogger(allowedRemoteLegalNames?.firstOrNull()?.toString() ?: "AMQPChannelHandler")
     private lateinit var remoteAddress: InetSocketAddress
-    private lateinit var localCert: X509Certificate
-    private lateinit var remoteCert: X509Certificate
+    private var localCert: X509Certificate? = null
+    private var remoteCert: X509Certificate? = null
     private var eventProcessor: EventProcessor? = null
+    private var badCert: Boolean = false
 
     override fun channelActive(ctx: ChannelHandlerContext) {
         val ch = ctx.channel()
@@ -51,7 +52,7 @@ internal class AMQPChannelHandler(private val serverMode: Boolean,
 
     private fun createAMQPEngine(ctx: ChannelHandlerContext) {
         val ch = ctx.channel()
-        eventProcessor = EventProcessor(ch, serverMode, localCert.subjectX500Principal.toString(), remoteCert.subjectX500Principal.toString(), userName, password)
+        eventProcessor = EventProcessor(ch, serverMode, localCert!!.subjectX500Principal.toString(), remoteCert!!.subjectX500Principal.toString(), userName, password)
         val connection = eventProcessor!!.connection
         val transport = connection.transport as ProtonJTransport
         if (trace) {
@@ -72,7 +73,7 @@ internal class AMQPChannelHandler(private val serverMode: Boolean,
     override fun channelInactive(ctx: ChannelHandlerContext) {
         val ch = ctx.channel()
         log.info("Closed client connection ${ch.id()} from $remoteAddress to ${ch.localAddress()}")
-        onClose(Pair(ch as SocketChannel, ConnectionChange(remoteAddress, null, false)))
+        onClose(Pair(ch as SocketChannel, ConnectionChange(remoteAddress, remoteCert, false, badCert)))
         eventProcessor?.close()
         ctx.fireChannelInactive()
     }
@@ -83,27 +84,45 @@ internal class AMQPChannelHandler(private val serverMode: Boolean,
                 val sslHandler = ctx.pipeline().get(SslHandler::class.java)
                 localCert = sslHandler.engine().session.localCertificates[0].x509
                 remoteCert = sslHandler.engine().session.peerCertificates[0].x509
-                try {
-                    val remoteX500Name = CordaX500Name.build(remoteCert.subjectX500Principal)
-                    require(allowedRemoteLegalNames == null || remoteX500Name in allowedRemoteLegalNames)
-                    log.info("handshake completed subject: $remoteX500Name")
+                val remoteX500Name = try {
+                    CordaX500Name.build(remoteCert!!.subjectX500Principal)
                 } catch (ex: IllegalArgumentException) {
-                    log.error("Invalid certificate subject", ex)
+                    badCert = true
+                    log.error("Certificate subject not a valid CordaX500Name", ex)
                     ctx.close()
                     return
                 }
+                if (allowedRemoteLegalNames != null && remoteX500Name !in allowedRemoteLegalNames) {
+                    badCert = true
+                    log.error("Provided certificate subject $remoteX500Name not in expected set $allowedRemoteLegalNames")
+                    ctx.close()
+                    return
+                }
+                log.info("Handshake completed with subject: $remoteX500Name")
                 createAMQPEngine(ctx)
-                onOpen(Pair(ctx.channel() as SocketChannel, ConnectionChange(remoteAddress, remoteCert, true)))
+                onOpen(Pair(ctx.channel() as SocketChannel, ConnectionChange(remoteAddress, remoteCert, true, false)))
             } else {
-                log.error("Handshake failure $evt")
+                badCert = true
+                log.error("Handshake failure ${evt.cause().message}")
+                if (log.isTraceEnabled) {
+                    log.trace("Handshake failure", evt.cause())
+                }
                 ctx.close()
             }
         }
     }
 
+    @Suppress("OverridingDeprecatedMember")
+    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+        log.warn("Closing channel due to nonrecoverable exception ${cause.message}")
+        if (log.isTraceEnabled) {
+            log.trace("Pipeline uncaught exception", cause)
+        }
+        ctx.close()
+    }
+
     override fun channelRead(ctx: ChannelHandlerContext, msg: Any) {
         try {
-            log.debug { "Received $msg" }
             if (msg is ByteBuf) {
                 eventProcessor!!.transportProcessInput(msg)
             }
@@ -116,16 +135,15 @@ internal class AMQPChannelHandler(private val serverMode: Boolean,
     override fun write(ctx: ChannelHandlerContext, msg: Any, promise: ChannelPromise) {
         try {
             try {
-                log.debug { "Sent $msg" }
                 when (msg) {
                 // Transfers application packet into the AMQP engine.
                     is SendableMessageImpl -> {
                         val inetAddress = InetSocketAddress(msg.destinationLink.host, msg.destinationLink.port)
                         require(inetAddress == remoteAddress) {
-                            "Message for incorrect endpoint"
+                            "Message for incorrect endpoint $inetAddress expected $remoteAddress"
                         }
-                        require(CordaX500Name.parse(msg.destinationLegalName) == CordaX500Name.build(remoteCert.subjectX500Principal)) {
-                            "Message for incorrect legal identity"
+                        require(CordaX500Name.parse(msg.destinationLegalName) == CordaX500Name.build(remoteCert!!.subjectX500Principal)) {
+                            "Message for incorrect legal identity ${msg.destinationLegalName} expected ${remoteCert!!.subjectX500Principal}"
                         }
                         log.debug { "channel write ${msg.applicationProperties["_AMQ_DUPL_ID"]}" }
                         eventProcessor!!.transportWriteMessage(msg)

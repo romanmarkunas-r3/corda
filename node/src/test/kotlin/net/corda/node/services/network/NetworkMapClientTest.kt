@@ -2,15 +2,15 @@ package net.corda.node.services.network
 
 import net.corda.core.crypto.Crypto
 import net.corda.core.crypto.sha256
-import net.corda.core.internal.*
+import net.corda.core.internal.sign
 import net.corda.core.serialization.serialize
 import net.corda.core.utilities.seconds
+import net.corda.testing.common.internal.testNetworkParameters
 import net.corda.testing.core.ALICE_NAME
 import net.corda.testing.core.BOB_NAME
-import net.corda.testing.core.DEV_ROOT_CA
 import net.corda.testing.core.SerializationEnvironmentRule
-import net.corda.testing.common.internal.testNetworkParameters
 import net.corda.testing.driver.PortAllocation
+import net.corda.testing.internal.DEV_ROOT_CA
 import net.corda.testing.internal.TestNodeInfoBuilder
 import net.corda.testing.internal.createNodeInfoAndSigned
 import net.corda.testing.internal.signWith
@@ -57,7 +57,7 @@ class NetworkMapClientTest {
 
         val nodeInfoHash = nodeInfo.serialize().sha256()
 
-        assertThat(networkMapClient.getNetworkMap().networkMap.nodeInfoHashes).containsExactly(nodeInfoHash)
+        assertThat(networkMapClient.getNetworkMap().payload.nodeInfoHashes).containsExactly(nodeInfoHash)
         assertEquals(nodeInfo, networkMapClient.getNodeInfo(nodeInfoHash))
 
         val (nodeInfo2, signedNodeInfo2) = createNodeInfoAndSigned(BOB_NAME)
@@ -65,7 +65,7 @@ class NetworkMapClientTest {
         networkMapClient.publish(signedNodeInfo2)
 
         val nodeInfoHash2 = nodeInfo2.serialize().sha256()
-        assertThat(networkMapClient.getNetworkMap().networkMap.nodeInfoHashes).containsExactly(nodeInfoHash, nodeInfoHash2)
+        assertThat(networkMapClient.getNetworkMap().payload.nodeInfoHashes).containsExactly(nodeInfoHash, nodeInfoHash2)
         assertEquals(cacheTimeout, networkMapClient.getNetworkMap().cacheMaxAge)
         assertEquals(nodeInfo2, networkMapClient.getNodeInfo(nodeInfoHash2))
     }
@@ -73,8 +73,8 @@ class NetworkMapClientTest {
     @Test
     fun `errors return a meaningful error message`() {
         val nodeInfoBuilder = TestNodeInfoBuilder()
-        val (_, aliceKey) = nodeInfoBuilder.addIdentity(ALICE_NAME)
-        nodeInfoBuilder.addIdentity(BOB_NAME)
+        val (_, aliceKey) = nodeInfoBuilder.addLegalIdentity(ALICE_NAME)
+        nodeInfoBuilder.addLegalIdentity(BOB_NAME)
         val nodeInfo3 = nodeInfoBuilder.build()
         val signedNodeInfo3 = nodeInfo3.signWith(listOf(aliceKey))
 
@@ -84,11 +84,11 @@ class NetworkMapClientTest {
     }
 
     @Test
-    fun `download NetworkParameter correctly`() {
+    fun `download NetworkParameters correctly`() {
         // The test server returns same network parameter for any hash.
         val parametersHash = server.networkParameters.serialize().hash
-        val networkParameter = networkMapClient.getNetworkParameters(parametersHash).verified()
-        assertEquals(server.networkParameters, networkParameter)
+        val networkParameters = networkMapClient.getNetworkParameters(parametersHash).verified()
+        assertEquals(server.networkParameters, networkParameters)
     }
 
     @Test
@@ -98,7 +98,7 @@ class NetworkMapClientTest {
 
     @Test
     fun `handle parameters update`() {
-        val nextParameters = testNetworkParameters(emptyList(), epoch = 2)
+        val nextParameters = testNetworkParameters(epoch = 2)
         val originalNetworkParameterHash = server.networkParameters.serialize().hash
         val nextNetworkParameterHash = nextParameters.serialize().hash
         val description = "Test parameters"

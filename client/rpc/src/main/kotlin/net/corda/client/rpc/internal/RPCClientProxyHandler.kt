@@ -1,24 +1,23 @@
 package net.corda.client.rpc.internal
 
-import com.esotericsoftware.kryo.Kryo
-import com.esotericsoftware.kryo.Serializer
-import com.esotericsoftware.kryo.io.Input
-import com.esotericsoftware.kryo.io.Output
-import com.google.common.cache.Cache
-import com.google.common.cache.CacheBuilder
-import com.google.common.cache.RemovalCause
-import com.google.common.cache.RemovalListener
+import co.paralleluniverse.common.util.SameThreadExecutor
+import com.github.benmanes.caffeine.cache.Cache
+import com.github.benmanes.caffeine.cache.Caffeine
+import com.github.benmanes.caffeine.cache.RemovalCause
+import com.github.benmanes.caffeine.cache.RemovalListener
 import com.google.common.util.concurrent.SettableFuture
 import com.google.common.util.concurrent.ThreadFactoryBuilder
+import net.corda.client.rpc.CordaRPCClientConfiguration
 import net.corda.client.rpc.RPCException
 import net.corda.client.rpc.RPCSinceVersion
+import net.corda.client.rpc.internal.serialization.amqp.RpcClientObservableSerializer
 import net.corda.core.context.Actor
 import net.corda.core.context.Trace
 import net.corda.core.context.Trace.InvocationId
-import net.corda.core.internal.LazyPool
 import net.corda.core.internal.LazyStickyPool
 import net.corda.core.internal.LifeCycle
 import net.corda.core.internal.ThreadBox
+import net.corda.core.internal.times
 import net.corda.core.messaging.RPCOps
 import net.corda.core.serialization.SerializationContext
 import net.corda.core.serialization.serialize
@@ -26,23 +25,34 @@ import net.corda.core.utilities.Try
 import net.corda.core.utilities.contextLogger
 import net.corda.core.utilities.debug
 import net.corda.core.utilities.getOrThrow
-import net.corda.nodeapi.ArtemisConsumer
-import net.corda.nodeapi.ArtemisProducer
 import net.corda.nodeapi.RPCApi
+import net.corda.nodeapi.internal.DeduplicationChecker
+import org.apache.activemq.artemis.api.core.ActiveMQException
+import org.apache.activemq.artemis.api.core.ActiveMQNotConnectedException
 import org.apache.activemq.artemis.api.core.RoutingType
 import org.apache.activemq.artemis.api.core.SimpleString
 import org.apache.activemq.artemis.api.core.client.ActiveMQClient.DEFAULT_ACK_BATCH_SIZE
+import org.apache.activemq.artemis.api.core.client.ClientConsumer
 import org.apache.activemq.artemis.api.core.client.ClientMessage
+import org.apache.activemq.artemis.api.core.client.ClientProducer
+import org.apache.activemq.artemis.api.core.client.ClientSession
+import org.apache.activemq.artemis.api.core.client.ClientSessionFactory
+import org.apache.activemq.artemis.api.core.client.FailoverEventType
 import org.apache.activemq.artemis.api.core.client.ServerLocator
 import rx.Notification
 import rx.Observable
 import rx.subjects.UnicastSubject
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.Method
-import java.time.Instant
 import java.util.*
-import java.util.concurrent.*
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.reflect.jvm.javaMethod
 
 /**
@@ -67,9 +77,15 @@ import kotlin.reflect.jvm.javaMethod
  * unsubscribing from the [Observable], or if the [Observable] is garbage collected the client will eventually
  * automatically signal the server. This is done using a cache that holds weak references to the [UnicastSubject]s.
  * The cleanup happens in batches using a dedicated reaper, scheduled on [reaperExecutor].
+ *
+ * The client will attempt to failover in case the server become unreachable. Depending on the [ServerLocataor] instance
+ * passed in the constructor, failover is either handle at Artemis level or client level. If only one transport
+ * was used to create the [ServerLocator], failover is handled by Artemis (retrying based on [CordaRPCClientConfiguration].
+ * If a list of transport configurations was used, failover is handled locally. Artemis is able to do it, however the
+ * brokers on server side need to be configured in HA mode and the [ServerLocator] needs to be created with HA as well.
  */
 class RPCClientProxyHandler(
-        private val rpcConfiguration: RPCClientConfiguration,
+        private val rpcConfiguration: CordaRPCClientConfiguration,
         private val rpcUsername: String,
         private val rpcPassword: String,
         private val serverLocator: ServerLocator,
@@ -111,6 +127,8 @@ class RPCClientProxyHandler(
 
     // Used for reaping
     private var reaperExecutor: ScheduledExecutorService? = null
+    // Used for sending
+    private var sendExecutor: ExecutorService? = null
 
     // A sticky pool for running Observable.onNext()s. We need the stickiness to preserve the observation ordering.
     private val observationExecutorThreadFactory = ThreadFactoryBuilder().setNameFormat("rpc-client-observation-pool-%d").setDaemon(true).build()
@@ -140,10 +158,10 @@ class RPCClientProxyHandler(
     private val serializationContextWithObservableContext = RpcClientObservableSerializer.createContext(serializationContext, observableContext)
 
     private fun createRpcObservableMap(): RpcObservableMap {
-        val onObservableRemove = RemovalListener<InvocationId, UnicastSubject<Notification<*>>> {
-            val observableId = it.key!!
+        val onObservableRemove = RemovalListener<InvocationId, UnicastSubject<Notification<*>>> { key, _, cause ->
+            val observableId = key!!
             val rpcCallSite = callSiteMap?.remove(observableId)
-            if (it.cause == RemovalCause.COLLECTED) {
+            if (cause == RemovalCause.COLLECTED) {
                 log.warn(listOf(
                         "A hot observable returned from an RPC was never subscribed to.",
                         "This wastes server-side resources because it was queueing observations for retrieval.",
@@ -154,29 +172,24 @@ class RPCClientProxyHandler(
             }
             observablesToReap.locked { observables.add(observableId) }
         }
-        return CacheBuilder.newBuilder().
+        return Caffeine.newBuilder().
                 weakValues().
-                removalListener(onObservableRemove).
-                concurrencyLevel(rpcConfiguration.cacheConcurrencyLevel).
+                removalListener(onObservableRemove).executor(SameThreadExecutor.getExecutor()).
                 build()
     }
 
-    // We cannot pool consumers as we need to preserve the original muxed message order.
-    // TODO We may need to pool these somehow anyway, otherwise if the server sends many big messages in parallel a
-    // single consumer may be starved for flow control credits. Recheck this once Artemis's large message streaming is
-    // integrated properly.
-    private var sessionAndConsumer: ArtemisConsumer? = null
-    // Pool producers to reduce contention on the client side.
-    private val sessionAndProducerPool = LazyPool(bound = rpcConfiguration.producerPoolBound) {
-        // Note how we create new sessions *and* session factories per producer.
-        // We cannot simply pool producers on one session because sessions are single threaded.
-        // We cannot simply pool sessions on one session factory because flow control credits are tied to factories, so
-        // sessions tend to starve each other when used concurrently.
-        val sessionFactory = serverLocator.createSessionFactory()
-        val session = sessionFactory.createSession(rpcUsername, rpcPassword, false, true, true, false, DEFAULT_ACK_BATCH_SIZE)
-        session.start()
-        ArtemisProducer(sessionFactory, session, session.createProducer(RPCApi.RPC_SERVER_QUEUE_NAME))
-    }
+    private var sessionFactory: ClientSessionFactory? = null
+    private var producerSession: ClientSession? = null
+    private var consumerSession: ClientSession? = null
+    private var rpcProducer: ClientProducer? = null
+    private var rpcConsumer: ClientConsumer? = null
+
+    private val deduplicationChecker = DeduplicationChecker(rpcConfiguration.deduplicationCacheExpiry)
+    private val deduplicationSequenceNumber = AtomicLong(0)
+
+    private val sendingEnabled = AtomicBoolean(true)
+    // Used to interrupt failover thread (i.e. client is closed while failing over).
+    private var haFailoverThread: Thread? = null
 
     /**
      * Start the client. This creates the per-client queue, starts the consumer session and the reaper.
@@ -187,22 +200,35 @@ class RPCClientProxyHandler(
                 1,
                 ThreadFactoryBuilder().setNameFormat("rpc-client-reaper-%d").setDaemon(true).build()
         )
+        sendExecutor = Executors.newSingleThreadExecutor(
+                ThreadFactoryBuilder().setNameFormat("rpc-client-sender-%d").build()
+        )
         reaperScheduledFuture = reaperExecutor!!.scheduleAtFixedRate(
                 this::reapObservablesAndNotify,
                 rpcConfiguration.reapInterval.toMillis(),
                 rpcConfiguration.reapInterval.toMillis(),
                 TimeUnit.MILLISECONDS
         )
-        sessionAndProducerPool.run {
-            it.session.createTemporaryQueue(clientAddress, RoutingType.ANYCAST, clientAddress)
+        // Create a session factory using the first available server. If more than one transport configuration was
+        // used when creating the server locator, every one will be tried during failover. The locator will round-robin
+        // through the available transport configurations with the starting position being generated randomly.
+        // If there's only one available, that one will be retried continuously as configured in rpcConfiguration.
+        // There is no failover on first attempt, meaning that if a connection cannot be established, the serverLocator
+        // will try another transport if it exists or throw an exception otherwise.
+        try {
+            sessionFactory = serverLocator.createSessionFactory()
+        } catch (e: ActiveMQNotConnectedException) {
+            throw (RPCException("Cannot connect to server(s). Tried with all available servers.", e))
         }
-        val sessionFactory = serverLocator.createSessionFactory()
-        val session = sessionFactory.createSession(rpcUsername, rpcPassword, false, true, true, false, DEFAULT_ACK_BATCH_SIZE)
-        val consumer = session.createConsumer(clientAddress)
-        consumer.setMessageHandler(this@RPCClientProxyHandler::artemisMessageHandler)
-        sessionAndConsumer = ArtemisConsumer(sessionFactory, session, consumer)
+        // Depending on how the client is constructed, connection failure is treated differently
+        if (serverLocator.staticTransportConfigurations.size == 1) {
+            sessionFactory!!.addFailoverListener(this::failoverHandler)
+        } else {
+            sessionFactory!!.addFailoverListener(this::haFailoverHandler)
+        }
+        initSessions()
         lifeCycle.transition(State.UNSTARTED, State.SERVER_VERSION_NOT_SET)
-        session.start()
+        startSessions()
     }
 
     // This is the general function that transforms a client side RPC to internal Artemis messages.
@@ -212,31 +238,32 @@ class RPCClientProxyHandler(
         if (method == toStringMethod) {
             return "Client RPC proxy for $rpcOpsClass"
         }
-        if (sessionAndConsumer!!.session.isClosed) {
+        if (consumerSession!!.isClosed) {
             throw RPCException("RPC Proxy is closed")
         }
+
+        if (!sendingEnabled.get())
+            throw RPCException("RPC server is not available.")
 
         val replyId = InvocationId.newInstance()
         callSiteMap?.set(replyId, Throwable("<Call site of root RPC '${method.name}'>"))
         try {
             val serialisedArguments = (arguments?.toList() ?: emptyList()).serialize(context = serializationContextWithObservableContext)
-            val request = RPCApi.ClientToServer.RpcRequest(clientAddress, method.name, serialisedArguments.bytes, replyId, sessionId, externalTrace, impersonatedActor)
+            val request = RPCApi.ClientToServer.RpcRequest(
+                    clientAddress,
+                    method.name,
+                    serialisedArguments,
+                    replyId,
+                    sessionId,
+                    externalTrace,
+                    impersonatedActor
+            )
             val replyFuture = SettableFuture.create<Any>()
-            sessionAndProducerPool.run {
-                val message = it.session.createMessage(false)
-                request.writeToClientMessage(message)
-
-                log.debug {
-                    val argumentsString = arguments?.joinToString() ?: ""
-                    "-> RPC(${replyId.value}) -> ${method.name}($argumentsString): ${method.returnType}"
-                }
-
-                require(rpcReplyMap.put(replyId, replyFuture) == null) {
-                    "Generated several RPC requests with same ID $replyId"
-                }
-                it.producer.send(message)
-                it.session.commit()
+            require(rpcReplyMap.put(replyId, replyFuture) == null) {
+                "Generated several RPC requests with same ID $replyId"
             }
+
+            sendMessage(request)
             return replyFuture.getOrThrow()
         } catch (e: RuntimeException) {
             // Already an unchecked exception, so just rethrow it
@@ -249,9 +276,24 @@ class RPCClientProxyHandler(
         }
     }
 
+    private fun sendMessage(message: RPCApi.ClientToServer) {
+        val artemisMessage = producerSession!!.createMessage(false)
+        message.writeToClientMessage(artemisMessage)
+        sendExecutor!!.submit {
+            artemisMessage.putLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME, deduplicationSequenceNumber.getAndIncrement())
+            log.debug { "-> RPC -> $message" }
+            rpcProducer!!.send(artemisMessage)
+        }
+    }
+
     // The handler for Artemis messages.
     private fun artemisMessageHandler(message: ClientMessage) {
         val serverToClient = RPCApi.ServerToClient.fromClientMessage(serializationContextWithObservableContext, message)
+        val deduplicationSequenceNumber = message.getLongProperty(RPCApi.DEDUPLICATION_SEQUENCE_NUMBER_FIELD_NAME)
+        if (deduplicationChecker.checkDuplicateMessageId(serverToClient.deduplicationIdentity, deduplicationSequenceNumber)) {
+            log.info("Message duplication detected, discarding message")
+            return
+        }
         log.debug { "Got message from RPC server $serverToClient" }
         when (serverToClient) {
             is RPCApi.ServerToClient.RpcReply -> {
@@ -325,14 +367,24 @@ class RPCClientProxyHandler(
      * @param notify whether to notify observables or not.
      */
     private fun close(notify: Boolean = true) {
-        sessionAndConsumer?.sessionFactory?.close()
+        haFailoverThread?.apply {
+            interrupt()
+            join(1000)
+        }
+
+        if (notify) {
+            // This is going to send remote message, see `org.apache.activemq.artemis.core.client.impl.ClientConsumerImpl.doCleanUp()`.
+            sessionFactory?.close()
+        } else {
+            // This performs a cheaper and faster version of local cleanup.
+            sessionFactory?.cleanup()
+        }
+
         reaperScheduledFuture?.cancel(false)
         observableContext.observableMap.invalidateAll()
         reapObservables(notify)
         reaperExecutor?.shutdownNow()
-        sessionAndProducerPool.close().forEach {
-            it.sessionFactory.close()
-        }
+        sendExecutor?.shutdownNow()
         // Note the ordering is important, we shut down the consumer *before* the observation executor, otherwise we may
         // leak borrowed executors.
         val observationExecutors = observationExecutorPool.close()
@@ -385,12 +437,120 @@ class RPCClientProxyHandler(
         }
         if (observableIds != null) {
             log.debug { "Reaping ${observableIds.size} observables" }
-            sessionAndProducerPool.run {
-                val message = it.session.createMessage(false)
-                RPCApi.ClientToServer.ObservablesClosed(observableIds).writeToClientMessage(message)
-                it.producer.send(message)
+            sendMessage(RPCApi.ClientToServer.ObservablesClosed(observableIds))
+        }
+    }
+
+    private fun attemptReconnect() {
+        var reconnectAttempts = rpcConfiguration.maxReconnectAttempts.times(serverLocator.staticTransportConfigurations.size)
+        var retryInterval = rpcConfiguration.connectionRetryInterval
+        val maxRetryInterval = rpcConfiguration.connectionMaxRetryInterval
+
+        var transportIterator = serverLocator.staticTransportConfigurations.iterator()
+        while (transportIterator.hasNext() && reconnectAttempts != 0) {
+            val transport = transportIterator.next()
+            if (!transportIterator.hasNext())
+                transportIterator = serverLocator.staticTransportConfigurations.iterator()
+
+            log.debug("Trying to connect using ${transport.params}")
+            try {
+                if (!serverLocator.isClosed) {
+                    sessionFactory = serverLocator.createSessionFactory(transport)
+                } else {
+                    log.warn("Stopping reconnect attempts.")
+                    log.debug("Server locator is closed or garbage collected. Proxy may have been closed during reconnect.")
+                    break
+                }
+            } catch (e: ActiveMQException) {
+                try {
+                    Thread.sleep(retryInterval.toMillis())
+                } catch (e: InterruptedException) {}
+                // Could not connect, try with next server transport.
+                reconnectAttempts--
+                retryInterval = minOf(maxRetryInterval, retryInterval.times(rpcConfiguration.connectionRetryIntervalMultiplier.toLong()))
+                continue
+            }
+
+            log.debug("Connected successfully after $reconnectAttempts attempts using ${transport.params}.")
+            log.info("RPC server available.")
+            sessionFactory!!.addFailoverListener(this::haFailoverHandler)
+            initSessions()
+            startSessions()
+            sendingEnabled.set(true)
+            break
+        }
+
+        if (reconnectAttempts == 0 || sessionFactory == null)
+            log.error("Could not reconnect to the RPC server.")
+    }
+
+    private fun initSessions() {
+        producerSession = sessionFactory!!.createSession(rpcUsername, rpcPassword, false, true, true, false, DEFAULT_ACK_BATCH_SIZE)
+        rpcProducer = producerSession!!.createProducer(RPCApi.RPC_SERVER_QUEUE_NAME)
+        consumerSession = sessionFactory!!.createSession(rpcUsername, rpcPassword, false, true, true, false, DEFAULT_ACK_BATCH_SIZE)
+        consumerSession!!.createTemporaryQueue(clientAddress, RoutingType.ANYCAST, clientAddress)
+        rpcConsumer = consumerSession!!.createConsumer(clientAddress)
+        rpcConsumer!!.setMessageHandler(this::artemisMessageHandler)
+    }
+
+    private fun startSessions() {
+        consumerSession!!.start()
+        producerSession!!.start()
+    }
+
+    private fun haFailoverHandler(event: FailoverEventType) {
+        if (event == FailoverEventType.FAILURE_DETECTED) {
+            log.warn("Connection failure. Attempting to reconnect using back-up addresses.")
+            cleanUpOnConnectionLoss()
+            sessionFactory?.apply {
+                connection.destroy()
+                cleanup()
+                close()
+            }
+            haFailoverThread = Thread.currentThread()
+            attemptReconnect()
+        }
+        // Other events are not considered as reconnection is not done by Artemis.
+    }
+
+    private fun failoverHandler(event: FailoverEventType) {
+        when (event) {
+            FailoverEventType.FAILURE_DETECTED -> {
+               cleanUpOnConnectionLoss()
+            }
+
+            FailoverEventType.FAILOVER_COMPLETED -> {
+                sendingEnabled.set(true)
+                log.info("RPC server available.")
+            }
+
+            FailoverEventType.FAILOVER_FAILED -> {
+                log.error("Could not reconnect to the RPC server.")
             }
         }
+    }
+
+    private fun cleanUpOnConnectionLoss() {
+        sendingEnabled.set(false)
+        log.warn("Terminating observables.")
+        val m = observableContext.observableMap.asMap()
+        m.keys.forEach { k ->
+            observationExecutorPool.run(k) {
+                try {
+                    m[k]?.onError(RPCException("Connection failure detected."))
+                } catch (th: Throwable) {
+                    log.error("Unexpected exception when RPC connection failure handling", th)
+                }
+            }
+        }
+        observableContext.observableMap.invalidateAll()
+
+        rpcReplyMap.forEach { _, replyFuture ->
+            replyFuture.setException(RPCException("Connection failure detected."))
+        }
+
+        rpcReplyMap.clear()
+        callSiteMap?.clear()
     }
 }
 
@@ -410,62 +570,3 @@ data class ObservableContext(
         val hardReferenceStore: MutableSet<Observable<*>>
 )
 
-/**
- * A [Serializer] to deserialise Observables once the corresponding Kryo instance has been provided with an [ObservableContext].
- */
-object RpcClientObservableSerializer : Serializer<Observable<*>>() {
-    private object RpcObservableContextKey
-
-    fun createContext(serializationContext: SerializationContext, observableContext: ObservableContext): SerializationContext {
-        return serializationContext.withProperty(RpcObservableContextKey, observableContext)
-    }
-
-    private fun <T> pinInSubscriptions(observable: Observable<T>, hardReferenceStore: MutableSet<Observable<*>>): Observable<T> {
-        val refCount = AtomicInteger(0)
-        return observable.doOnSubscribe {
-            if (refCount.getAndIncrement() == 0) {
-                require(hardReferenceStore.add(observable)) { "Reference store already contained reference $this on add" }
-            }
-        }.doOnUnsubscribe {
-            if (refCount.decrementAndGet() == 0) {
-                require(hardReferenceStore.remove(observable)) { "Reference store did not contain reference $this on remove" }
-            }
-        }
-    }
-
-    override fun read(kryo: Kryo, input: Input, type: Class<Observable<*>>): Observable<Any> {
-        val observableContext = kryo.context[RpcObservableContextKey] as ObservableContext
-        val observableId = input.readInvocationId() ?: throw IllegalStateException("Unable to read invocationId from Input.")
-        val observable = UnicastSubject.create<Notification<*>>()
-        require(observableContext.observableMap.getIfPresent(observableId) == null) {
-            "Multiple Observables arrived with the same ID $observableId"
-        }
-        val rpcCallSite = getRpcCallSite(kryo, observableContext)
-        observableContext.observableMap.put(observableId, observable)
-        observableContext.callSiteMap?.put(observableId, rpcCallSite)
-        // We pin all Observables into a hard reference store (rooted in the RPC proxy) on subscription so that users
-        // don't need to store a reference to the Observables themselves.
-        return pinInSubscriptions(observable, observableContext.hardReferenceStore).doOnUnsubscribe {
-            // This causes Future completions to give warnings because the corresponding OnComplete sent from the server
-            // will arrive after the client unsubscribes from the observable and consequently invalidates the mapping.
-            // The unsubscribe is due to [ObservableToFuture]'s use of first().
-            observableContext.observableMap.invalidate(observableId)
-        }.dematerialize()
-    }
-
-    private fun Input.readInvocationId() : InvocationId? {
-
-        val value = readString() ?: return null
-        val timestamp = readLong()
-        return InvocationId(value, Instant.ofEpochMilli(timestamp))
-    }
-
-    override fun write(kryo: Kryo, output: Output, observable: Observable<*>) {
-        throw UnsupportedOperationException("Cannot serialise Observables on the client side")
-    }
-
-    private fun getRpcCallSite(kryo: Kryo, observableContext: ObservableContext): Throwable? {
-        val rpcRequestOrObservableId = kryo.context[RPCApi.RpcRequestOrObservableIdKey] as InvocationId
-        return observableContext.callSiteMap?.get(rpcRequestOrObservableId)
-    }
-}

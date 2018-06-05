@@ -9,7 +9,7 @@ import net.corda.testing.core.BOB_NAME
 import net.corda.testing.core.DUMMY_NOTARY_NAME
 import java.nio.file.Paths
 
-fun main(args: Array<String>) = CustomNotaryCordform().deployNodes()
+fun main(args: Array<String>) = CustomNotaryCordform().nodeRunner().deployAndRunNodes()
 
 class CustomNotaryCordform : CordformDefinition() {
     init {
@@ -22,6 +22,7 @@ class CustomNotaryCordform : CordformDefinition() {
                 adminAddress("localhost:10103")
             }
             rpcUsers(notaryDemoUser)
+            devMode(true)
         }
         node {
             name(BOB_NAME)
@@ -30,6 +31,7 @@ class CustomNotaryCordform : CordformDefinition() {
                 address("localhost:10006")
                 adminAddress("localhost:10106")
             }
+            devMode(true)
         }
         node {
             name(DUMMY_NOTARY_NAME)
@@ -39,6 +41,7 @@ class CustomNotaryCordform : CordformDefinition() {
                 adminAddress("localhost:10110")
             }
             notary(NotaryConfig(validating = true, custom = true))
+            devMode(true)
         }
     }
 

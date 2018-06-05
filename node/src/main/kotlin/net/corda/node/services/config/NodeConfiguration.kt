@@ -1,6 +1,7 @@
 package net.corda.node.services.config
 
 import com.typesafe.config.Config
+import com.typesafe.config.ConfigException
 import net.corda.core.context.AuthServiceId
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.internal.div
@@ -9,40 +10,45 @@ import net.corda.core.utilities.loggerFor
 import net.corda.core.utilities.seconds
 import net.corda.node.internal.artemis.CertificateChainCheckPolicy
 import net.corda.node.services.config.rpc.NodeRpcOptions
+import net.corda.nodeapi.BrokerRpcSslOptions
 import net.corda.nodeapi.internal.config.NodeSSLConfiguration
-import net.corda.nodeapi.internal.config.SSLConfiguration
+import net.corda.nodeapi.internal.config.UnknownConfigKeysPolicy
 import net.corda.nodeapi.internal.config.User
 import net.corda.nodeapi.internal.config.parseAs
 import net.corda.nodeapi.internal.persistence.DatabaseConfig
+import net.corda.tools.shell.SSHDConfiguration
+import org.bouncycastle.asn1.x500.X500Name
+import org.slf4j.Logger
 import java.net.URL
 import java.nio.file.Path
 import java.time.Duration
 import java.util.*
-
 
 val Int.MB: Long get() = this * 1024L * 1024L
 
 interface NodeConfiguration : NodeSSLConfiguration {
     val myLegalName: CordaX500Name
     val emailAddress: String
-    val exportJMXto: String
+    val jmxMonitoringHttpPort: Int?
     val dataSourceProperties: Properties
     val rpcUsers: List<User>
     val security: SecurityConfiguration?
     val devMode: Boolean
     val devModeOptions: DevModeOptions?
     val compatibilityZoneURL: URL?
+    val networkServices: NetworkServicesConfig?
     val certificateChainCheckPolicies: List<CertChainPolicyConfig>
     val verifierType: VerifierType
-    val messageRedeliveryDelaySeconds: Int
+    val p2pMessagingRetry: P2PMessagingRetryConfiguration
     val notary: NotaryConfig?
-    val activeMQServer: ActiveMqServerConfiguration
     val additionalNodeInfoPollingFrequencyMsec: Long
     val p2pAddress: NetworkHostAndPort
     val rpcOptions: NodeRpcOptions
     val messagingServerAddress: NetworkHostAndPort?
+    val messagingServerExternal: Boolean
     // TODO Move into DevModeOptions
     val useTestClock: Boolean get() = false
+    val lazyBridgeStart: Boolean
     val detectPublicIp: Boolean get() = true
     val sshd: SSHDConfiguration?
     val database: DatabaseConfig
@@ -52,6 +58,9 @@ interface NodeConfiguration : NodeSSLConfiguration {
     val attachmentCacheBound: Long get() = defaultAttachmentCacheBound
     // do not change this value without syncing it with ScheduledFlowsDrainingModeTest
     val drainingModePollPeriod: Duration get() = Duration.ofSeconds(5)
+    val extraNetworkMapKeys: List<UUID>
+    val tlsCertCrlDistPoint: URL?
+    val tlsCertCrlIssuer: String?
 
     fun validate(): List<String>
 
@@ -65,7 +74,7 @@ interface NodeConfiguration : NodeSSLConfiguration {
         }
 
         val defaultAttachmentContentCacheSize: Long = 10.MB
-        val defaultAttachmentCacheBound = 1024L
+        const val defaultAttachmentCacheBound = 1024L
     }
 }
 
@@ -82,13 +91,15 @@ fun NodeConfiguration.shouldInitCrashShell() = shouldStartLocalShell() || should
 data class NotaryConfig(val validating: Boolean,
                         val raft: RaftConfig? = null,
                         val bftSMaRt: BFTSMaRtConfiguration? = null,
-                        val custom: Boolean = false
+                        val custom: Boolean = false,
+                        val serviceLegalName: CordaX500Name? = null
 ) {
     init {
         require(raft == null || bftSMaRt == null || !custom) {
             "raft, bftSMaRt, and custom configs cannot be specified together"
         }
     }
+
     val isClusterConfig: Boolean get() = raft != null || bftSMaRt != null
 }
 
@@ -106,85 +117,168 @@ data class BFTSMaRtConfiguration(
     }
 }
 
-data class BridgeConfiguration(val retryIntervalMs: Long,
-                               val maxRetryIntervalMin: Long,
-                               val retryIntervalMultiplier: Double)
+/**
+ * Used as an alternative to the older compatibilityZoneURL to allow the doorman and network map
+ * services for a node to be configured as different URLs. Cannot be set at the same time as the
+ * compatibilityZoneURL, and will be defaulted (if not set) to both point at the configured
+ * compatibilityZoneURL.
+ *
+ * @property doormanURL The URL of the tls certificate signing service.
+ * @property networkMapURL The URL of the Network Map service.
+ * @property inferred Non user setting that indicates weather the Network Services configuration was
+ * set explicitly ([inferred] == false) or weather they have been inferred via the compatibilityZoneURL parameter
+ * ([inferred] == true) where both the network map and doorman are running on the same endpoint. Only one,
+ * compatibilityZoneURL or networkServices, can be set at any one time.
+ */
+data class NetworkServicesConfig(
+        val doormanURL: URL,
+        val networkMapURL: URL,
+        val inferred : Boolean = false
+)
 
-data class ActiveMqServerConfiguration(val bridge: BridgeConfiguration)
+/**
+ * Currently only used for notarisation requests.
+ *
+ * When the response doesn't arrive in time, the message is resent to a different notary-replica round-robin
+ * in case of clustered notaries.
+ */
+data class P2PMessagingRetryConfiguration(
+        val messageRedeliveryDelay: Duration,
+        val maxRetryCount: Int,
+        val backoffBase: Double
+)
 
-fun Config.parseAsNodeConfiguration(): NodeConfiguration = parseAs<NodeConfigurationImpl>()
+fun Config.parseAsNodeConfiguration(onUnknownKeys: ((Set<String>, logger: Logger) -> Unit) = UnknownConfigKeysPolicy.FAIL::handle): NodeConfiguration = parseAs<NodeConfigurationImpl>(onUnknownKeys)
 
 data class NodeConfigurationImpl(
         /** This is not retrieved from the config file but rather from a command line argument. */
         override val baseDirectory: Path,
         override val myLegalName: CordaX500Name,
+        override val jmxMonitoringHttpPort: Int? = null,
         override val emailAddress: String,
         override val keyStorePassword: String,
         override val trustStorePassword: String,
+        override val crlCheckSoftFail: Boolean,
         override val dataSourceProperties: Properties,
         override val compatibilityZoneURL: URL? = null,
+        override var networkServices: NetworkServicesConfig? = null,
+        override val tlsCertCrlDistPoint: URL? = null,
+        override val tlsCertCrlIssuer: String? = null,
         override val rpcUsers: List<User>,
-        override val security : SecurityConfiguration? = null,
+        override val security: SecurityConfiguration? = null,
         override val verifierType: VerifierType,
-        // TODO typesafe config supports the notion of durations. Make use of that by mapping it to java.time.Duration.
-        // Then rename this to messageRedeliveryDelay and make it of type Duration
-        override val messageRedeliveryDelaySeconds: Int = 30,
+        override val p2pMessagingRetry: P2PMessagingRetryConfiguration,
         override val p2pAddress: NetworkHostAndPort,
         private val rpcAddress: NetworkHostAndPort? = null,
         private val rpcSettings: NodeRpcSettings,
-        // TODO This field is slightly redundant as p2pAddress is sufficient to hold the address of the node's MQ broker.
-        // Instead this should be a Boolean indicating whether that broker is an internal one started by the node or an external one
         override val messagingServerAddress: NetworkHostAndPort?,
+        override val messagingServerExternal: Boolean = (messagingServerAddress != null),
         override val notary: NotaryConfig?,
-        override val certificateChainCheckPolicies: List<CertChainPolicyConfig>,
+        @Deprecated("Do not configure")
+        override val certificateChainCheckPolicies: List<CertChainPolicyConfig> = emptyList(),
         override val devMode: Boolean = false,
         override val noLocalShell: Boolean = false,
         override val devModeOptions: DevModeOptions? = null,
         override val useTestClock: Boolean = false,
+        override val lazyBridgeStart: Boolean = true,
         override val detectPublicIp: Boolean = true,
-        override val activeMQServer: ActiveMqServerConfiguration,
         // TODO See TODO above. Rename this to nodeInfoPollingFrequency and make it of type Duration
         override val additionalNodeInfoPollingFrequencyMsec: Long = 5.seconds.toMillis(),
         override val sshd: SSHDConfiguration? = null,
         override val database: DatabaseConfig = DatabaseConfig(initialiseSchema = devMode, exportHibernateJMXStatistics = devMode),
         private val transactionCacheSizeMegaBytes: Int? = null,
         private val attachmentContentCacheSizeMegaBytes: Int? = null,
-        override val attachmentCacheBound: Long = NodeConfiguration.defaultAttachmentCacheBound
-    ) : NodeConfiguration {
+        override val attachmentCacheBound: Long = NodeConfiguration.defaultAttachmentCacheBound,
+        override val extraNetworkMapKeys: List<UUID> = emptyList(),
+        // do not use or remove (breaks DemoBench together with rejection of unknown configuration keys during parsing)
+        private val h2port: Int = 0,
+        // do not use or remove (used by Capsule)
+        private val jarDirs: List<String> = emptyList()
+) : NodeConfiguration {
     companion object {
         private val logger = loggerFor<NodeConfigurationImpl>()
     }
 
-    override val rpcOptions: NodeRpcOptions = initialiseRpcOptions(rpcAddress, rpcSettings, SslOptions(baseDirectory / "certificates", keyStorePassword, trustStorePassword))
+    override val rpcOptions: NodeRpcOptions = initialiseRpcOptions(rpcAddress, rpcSettings, BrokerRpcSslOptions(baseDirectory / "certificates" / "nodekeystore.jks", keyStorePassword))
 
-    private fun initialiseRpcOptions(explicitAddress: NetworkHostAndPort?, settings: NodeRpcSettings, fallbackSslOptions: SSLConfiguration): NodeRpcOptions {
+    private fun initialiseRpcOptions(explicitAddress: NetworkHostAndPort?, settings: NodeRpcSettings, fallbackSslOptions: BrokerRpcSslOptions): NodeRpcOptions {
         return when {
             explicitAddress != null -> {
                 require(settings.address == null) { "Can't provide top-level rpcAddress and rpcSettings.address (they control the same property)." }
                 logger.warn("Top-level declaration of property 'rpcAddress' is deprecated. Please use 'rpcSettings.address' instead.")
+
                 settings.copy(address = explicitAddress)
             }
-            else -> settings
+            else -> {
+                settings.address ?: throw ConfigException.Missing("rpcSettings.address")
+                settings
+            }
         }.asOptions(fallbackSslOptions)
+    }
+
+    private fun validateTlsCertCrlConfig(): List<String> {
+        val errors = mutableListOf<String>()
+        if (tlsCertCrlIssuer != null) {
+            if (tlsCertCrlDistPoint == null) {
+                errors += "tlsCertCrlDistPoint needs to be specified when tlsCertCrlIssuer is not NULL"
+            }
+            try {
+                X500Name(tlsCertCrlIssuer)
+            } catch (e: Exception) {
+                errors += "Error when parsing tlsCertCrlIssuer: ${e.message}"
+            }
+        }
+        if (!crlCheckSoftFail && tlsCertCrlDistPoint == null) {
+            errors += "tlsCertCrlDistPoint needs to be specified when crlCheckSoftFail is FALSE"
+        }
+        return errors
     }
 
     override fun validate(): List<String> {
         val errors = mutableListOf<String>()
-        errors + validateRpcOptions(rpcOptions)
+        errors += validateDevModeOptions()
+        errors += validateRpcOptions(rpcOptions)
+        errors += validateTlsCertCrlConfig()
+        errors += validateNetworkServices()
         return errors
     }
 
     private fun validateRpcOptions(options: NodeRpcOptions): List<String> {
         val errors = mutableListOf<String>()
-        if (!options.useSsl) {
-            if (options.adminAddress == null) {
-                errors + "'rpcSettings.adminAddress': missing. Property is mandatory when 'rpcSettings.useSsl' is false (default)."
+        if (options.address != null) {
+            if (!options.useSsl && options.adminAddress == null) {
+                errors += "'rpcSettings.adminAddress': missing. Property is mandatory when 'rpcSettings.useSsl' is false (default)."
             }
         }
         return errors
     }
 
-    override val exportJMXto: String get() = "http"
+    private fun validateDevModeOptions(): List<String> {
+        if (devMode) {
+            compatibilityZoneURL?.let {
+                return listOf("'compatibilityZoneURL': present. Property cannot be set when 'devMode' is true.")
+            }
+
+            // if compatibiliZoneURL is set then it will be copied into the networkServices field and thus skipping
+            // this check by returning above is fine.
+            networkServices?.let {
+                return listOf("'networkServices': present. Property cannot be set when 'devMode' is true.")
+            }
+        }
+
+        return emptyList()
+    }
+
+    private fun validateNetworkServices(): List<String> {
+        val errors = mutableListOf<String>()
+
+        if (compatibilityZoneURL != null && networkServices != null && !(networkServices!!.inferred)) {
+            errors += "Cannot configure both compatibilityZoneUrl and networkServices simultaneously"
+        }
+
+        return errors
+    }
+
     override val transactionCacheSizeBytes: Long
         get() = transactionCacheSizeMegaBytes?.MB ?: super.transactionCacheSizeBytes
     override val attachmentContentCacheSizeBytes: Long
@@ -198,6 +292,15 @@ data class NodeConfigurationImpl(
         require(security == null || rpcUsers.isEmpty()) {
             "Cannot specify both 'rpcUsers' and 'security' in configuration"
         }
+        if(certificateChainCheckPolicies.isNotEmpty()) {
+            logger.warn("""You are configuring certificateChainCheckPolicies. This is a setting that is not used, and will be removed in a future version.
+                |Please contact the R3 team on the public slack to discuss your use case.
+            """.trimMargin())
+        }
+
+        if (compatibilityZoneURL != null && networkServices == null) {
+            networkServices = NetworkServicesConfig(compatibilityZoneURL, compatibilityZoneURL, true)
+        }
     }
 }
 
@@ -206,12 +309,12 @@ data class NodeRpcSettings(
         val adminAddress: NetworkHostAndPort?,
         val standAloneBroker: Boolean = false,
         val useSsl: Boolean = false,
-        val ssl: SslOptions?
+        val ssl: BrokerRpcSslOptions?
 ) {
-    fun asOptions(fallbackSslOptions: SSLConfiguration): NodeRpcOptions {
+    fun asOptions(fallbackSslOptions: BrokerRpcSslOptions): NodeRpcOptions {
         return object : NodeRpcOptions {
-            override val address = this@NodeRpcSettings.address
-            override val adminAddress = this@NodeRpcSettings.adminAddress
+            override val address = this@NodeRpcSettings.address!!
+            override val adminAddress = this@NodeRpcSettings.adminAddress!!
             override val standAloneBroker = this@NodeRpcSettings.standAloneBroker
             override val useSsl = this@NodeRpcSettings.useSsl
             override val sslConfig = this@NodeRpcSettings.ssl ?: fallbackSslOptions
@@ -236,6 +339,7 @@ enum class CertChainPolicyType {
     UsernameMustMatch
 }
 
+@Deprecated("Do not use")
 data class CertChainPolicyConfig(val role: String, private val policy: CertChainPolicyType, private val trustedAliases: Set<String>) {
     val certificateChainCheckPolicy: CertificateChainCheckPolicy
         get() {
@@ -248,8 +352,6 @@ data class CertChainPolicyConfig(val role: String, private val policy: CertChain
             }
         }
 }
-
-data class SSHDConfiguration(val port: Int)
 
 // Supported types of authentication/authorization data providers
 enum class AuthDataSourceType {
@@ -286,6 +388,8 @@ data class SecurityConfiguration(val authService: SecurityConfiguration.AuthServ
             }
         }
 
+        fun copyWithAdditionalUser(user: User) = AuthService(dataSource.copyWithAdditionalUser(user), id, options)
+
         // Optional components: cache
         data class Options(val cache: Options.Cache?) {
 
@@ -312,6 +416,12 @@ data class SecurityConfiguration(val authService: SecurityConfiguration.AuthServ
                     AuthDataSourceType.INMEMORY -> require(users != null && connection == null)
                     AuthDataSourceType.DB -> require(users == null && connection != null)
                 }
+            }
+
+            fun copyWithAdditionalUser(user: User): DataSource {
+                val extendedList = this.users?.toMutableList() ?: mutableListOf()
+                extendedList.add(user)
+                return DataSource(this.type, this.passwordEncryption, this.connection, listOf(*extendedList.toTypedArray()))
             }
         }
 
