@@ -19,6 +19,7 @@ import net.corda.testing.driver.NodeHandle
 import net.corda.testing.driver.internal.NodeHandleInternal
 import net.corda.testing.driver.internal.RandomFree
 import net.corda.testing.node.internal.*
+import net.corda.testing.node.internal.network.NetworkMapServer
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.After
