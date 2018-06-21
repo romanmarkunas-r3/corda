@@ -57,6 +57,9 @@ class FlowStateMachineImpl<R>(override val id: StateMachineRunId,
         fun currentStateMachine(): FlowStateMachineImpl<*>? = Strand.currentStrand() as? FlowStateMachineImpl<*>
     }
 
+    // TODO - for POC start and end timestamps are stored in exposed mutable list as a quick hack, please make it great
+    @Transient val checkpointTimestamps: MutableList<Instant> = mutableListOf()
+
     // These fields shouldn't be serialised, so they are marked @Transient.
     @Transient override lateinit var serviceHub: ServiceHubInternal
     @Transient override lateinit var ourIdentityAndCert: PartyAndCertificate
@@ -222,6 +225,15 @@ class FlowStateMachineImpl<R>(override val id: StateMachineRunId,
         require(!receiveType.isPrimitive) {
             "Use the wrapper type ${Primitives.wrap(receiveType).name} instead of the primitive $receiveType.class"
         }
+    }
+
+    @Suspendable
+    fun receiveRaw(otherParty: Party, sessionFlow: FlowLogic<*>): DataSessionMessage {
+        logger.debug { "receive([RAW], $otherParty) ..." }
+        val session = getConfirmedSession(otherParty, sessionFlow)
+        val receivedSessionMessage = receiveInternal(session, Object::class.java).message.checkDataSessionMessage()
+        logger.debug { "Received ${receivedSessionMessage.payload.toString().abbreviate(300)}" }
+        return receivedSessionMessage
     }
 
     @Suspendable

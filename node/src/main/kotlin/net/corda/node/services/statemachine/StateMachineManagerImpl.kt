@@ -38,6 +38,7 @@ import net.corda.node.services.api.ServiceHubInternal
 import net.corda.node.services.config.shouldCheckCheckpoints
 import net.corda.node.services.messaging.P2PMessagingHeaders
 import net.corda.node.services.messaging.ReceivedMessage
+import net.corda.node.services.statemachine.metered.Metered
 import net.corda.node.utilities.AffinityExecutor
 import net.corda.node.utilities.newNamedSingleThreadExecutor
 import net.corda.nodeapi.internal.persistence.CordaPersistence
@@ -50,10 +51,12 @@ import org.slf4j.Logger
 import rx.Observable
 import rx.subjects.PublishSubject
 import java.io.NotSerializableException
+import java.time.Instant
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit.SECONDS
 import javax.annotation.concurrent.ThreadSafe
+import kotlin.reflect.full.findAnnotation
 
 /**
  * The StateMachineManagerImpl will always invoke the flow fibers on the given [AffinityExecutor], regardless of which
@@ -533,6 +536,9 @@ class StateMachineManagerImpl(
 
     private fun updateCheckpoint(fiber: FlowStateMachineImpl<*>) {
         check(fiber.state != Strand.State.RUNNING) { "Fiber cannot be running when checkpointing" }
+
+        markCheckpointIfMetered(fiber)
+
         val newCheckpoint = Checkpoint(serializeFiber(fiber))
         val previousCheckpoint = mutex.locked { stateMachines.put(fiber, newCheckpoint) }
         if (previousCheckpoint != null) {
@@ -547,6 +553,14 @@ class StateMachineManagerImpl(
             if (deserializeFiber(newCheckpoint, fiber.logger) == null) {
                 unrestorableCheckpoints = true
             }
+        }
+
+        markCheckpointIfMetered(fiber)
+    }
+
+    private fun markCheckpointIfMetered(fiber: FlowStateMachineImpl<*>) {
+        if (fiber.logic::class.findAnnotation<Metered>() != null) {
+            fiber.checkpointTimestamps.add(Instant.now()!!)
         }
     }
 
